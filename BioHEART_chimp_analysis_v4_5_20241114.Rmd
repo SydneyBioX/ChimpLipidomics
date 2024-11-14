@@ -1,0 +1,3323 @@
+---
+title: "BioHEART and Chimp analysis"
+author: "Andy Tran"
+date: "University of Sydney | `r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    fig_caption: yes
+    number_sections: yes
+    self_contained: yes
+    theme: flatly
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Data loading and filtering {.tabset}
+
+## Load packages
+```{r}
+suppressPackageStartupMessages({
+  library(plotly)
+  library(tidyverse)
+  library(table1)
+  library(factoextra)
+  library(ggrepel)
+  library(qqman)
+  library(limma)
+  library(pROC)
+  library(TwoSampleMR)
+  })
+```
+
+## Load data
+
+```{r}
+bioheart_BIO <- readRDS("data/merged/bioheart_BIO_is_20240421.rds")
+bioheart_SampleData <- readRDS("data/merged/bioheart_SampleData.rds")
+chimp_BIO <- readRDS("data/merged/chimp_BIO_is_20240421.rds")
+clinical_data <- readRDS("data/merged/clinical_data.rds")
+chimp_clinical <- readRDS("data/merged/chimp_clinical.rds")
+class_mapping <- readRDS("data/merged/class_mapping.rds")
+
+genetics_mapping <- read.csv("data/bioheart/mapping.txt", header = FALSE, col.names= c("sampleID", "geneticsID"))
+genetics_mapping$record_id <- genetics_mapping$sampleID %>% sub("BH_|CT_", "", .)
+
+clinical_data <- clinical_data %>% 
+  mutate(bioheart_id = bioheart_id %>% sub("_0*", "_", .) %>% sub(" .*", "", .),
+         cacs_pct = as.numeric(cacs_pct),
+         cacs_log = log2(cacs + 1),
+         cacs_bin = factor(cacs > 0),
+         gensini_bin = factor(gensini > 0),
+         gensini_log = log2(gensini+1),
+         sps_d = as.numeric(sps_d),
+         sps_ratio = ifelse(gensini + sps_d == 0, 0, sps_d/(gensini + sps_d)))
+
+lipid_mapping <- read.csv("data/chimp/lipid_mapping/2023_09_04_BioHeart_updated_names.csv")
+lipid_mapping <- lipid_mapping %>% mutate(clean_names = janitor::make_clean_names(final_names))
+sum(colnames(bioheart_BIO) %in% lipid_mapping$clean_names)
+```
+
+```{r}
+areas_records <- plyr::mapvalues(rownames(bioheart_BIO),
+                                          from = bioheart_SampleData$InjectionLabel,
+                                          to = sub(" ", "", bioheart_SampleData$Other),
+                                          warn_missing = FALSE)
+
+areas_records <- plyr::mapvalues(areas_records,
+                                          from = clinical_data$tube_id_clean,
+                                          to = clinical_data$record_id,
+                                          warn_missing = FALSE)
+
+rownames(bioheart_BIO) <- areas_records
+```
+
+
+```{r}
+bioheart_BIO_totals <- bioheart_BIO %>% 
+  rownames_to_column("record_id") %>%
+  pivot_longer(cols = -record_id, names_to = "analyte", values_to = "value") %>%
+  mutate(class = plyr::mapvalues(analyte, from = class_mapping$analyte, to = class_mapping$Metabolite_Class)) %>%
+  group_by(record_id, class) %>%
+  summarise(total = sum(value)) %>%
+  pivot_wider(names_from = class, values_from = total) %>%
+  column_to_rownames("record_id")
+
+bioheart_BIO_totals <- bioheart_BIO_totals[match(rownames(bioheart_BIO), rownames(bioheart_BIO_totals)),]
+
+chimp_BIO_totals <- chimp_BIO %>% 
+  rownames_to_column("record_id") %>%
+  pivot_longer(cols = -record_id, names_to = "analyte", values_to = "value") %>%
+  mutate(class = plyr::mapvalues(analyte, from = class_mapping$analyte, to = class_mapping$Metabolite_Class)) %>%
+  group_by(record_id, class) %>%
+  summarise(total = sum(value)) %>%
+  pivot_wider(names_from = class, values_from = total) %>%
+  column_to_rownames("record_id")
+
+chimp_BIO_totals <- chimp_BIO_totals[match(rownames(chimp_BIO), rownames(chimp_BIO_totals)),]
+```
+
+
+
+## Data filtering
+
+```{r}
+####### FILTER OUT STATIN
+statin_records <- clinical_data %>% filter(statin == 1) %>% pull(record_id)
+areas_statin_inds <- which(rownames(bioheart_BIO) %in% statin_records)
+bioheart_BIO <- bioheart_BIO[-areas_statin_inds,]
+bioheart_BIO_totals <- bioheart_BIO_totals[-areas_statin_inds,]
+bioheart_SampleData <- bioheart_SampleData[-areas_statin_inds,]
+clinical_data <- clinical_data %>% filter(statin == 0)
+
+############### FILTER TO MALES
+############### Assuming human = 80 years, chimp = 35 years
+############### Filter to human 41-64yo male, chimp to 18-28
+
+# hist(clinical_data$age)
+# summary(clinical_data$age)
+# hist(chimp_clinical$Age...Calculated)
+
+# male_records <- clinical_data %>%
+#   filter(gender == 1) %>%
+#  #filter(age >= 41, age <= 64) %>%
+#   pull(record_id)
+# areas_male_inds <- which(rownames(bioheart_BIO) %in% male_records)
+# bioheart_BIO <- bioheart_BIO[areas_male_inds,]
+# bioheart_BIO_totals <- bioheart_BIO_totals[areas_male_inds,]
+# bioheart_SampleData <- bioheart_SampleData[areas_male_inds,]
+# clinical_data <- clinical_data %>% filter(gender == 1) #%>% filter(age >= 41, age <= 64)
+
+
+# old_records <- clinical_data %>%
+#   filter(age >= 60) %>%
+#   pull(record_id)
+# areas_old_inds <- which(rownames(bioheart_BIO) %in% old_records)
+# bioheart_BIO <- bioheart_BIO[areas_old_inds,]
+# bioheart_BIO_totals <- bioheart_BIO_totals[areas_old_inds,]
+# bioheart_SampleData <- bioheart_SampleData[areas_old_inds,]
+# clinical_data <- clinical_data %>% filter(age >= 60)
+
+# chimp_areas_records <- rownames(chimp_BIO)
+# chimp_male_records <- chimp_clinical %>%
+#   filter(Sex == "Male") %>%
+#   #filter(Age...Calculated >= 18, Age...Calculated <= 28) %>%
+#   pull(Study.ID)
+# chimp_areas_male_inds <- which(chimp_areas_records %in% chimp_male_records)
+# chimp_BIO <- chimp_BIO[chimp_areas_male_inds,]
+# chimp_BIO_totals <- chimp_BIO_totals[chimp_areas_male_inds,]
+# chimp_clinical <- chimp_clinical %>% filter(Sex == "Male") #%>% filter(Age...Calculated >= 18, Age...Calculated <= 28)
+
+# chimp_areas_records <- rownames(chimp_BIO)
+# chimp_old_records <- chimp_clinical %>%
+#   filter(Age...Calculated < 26) %>%
+#   pull(Study.ID)
+# chimp_areas_old_inds <- which(chimp_areas_records %in% chimp_old_records)
+# chimp_BIO <- chimp_BIO[chimp_areas_old_inds,]
+# chimp_BIO_totals <- chimp_BIO_totals[chimp_areas_old_inds,]
+# chimp_clinical <- chimp_clinical %>% filter(Age...Calculated < 26)
+
+```
+
+```{r}
+## matched subcohort
+library(MatchIt)
+
+chimp_clinical_blood <- readxl::read_excel("data/chimp/Primate CAD - Serum markers-20230418[64].xlsx")
+names(chimp_clinical_blood)[1] <- "Study.ID"
+chimp_clinical <- chimp_clinical %>%
+  left_join(chimp_clinical_blood, by = "Study.ID") %>% 
+  mutate(ldl = tc - hdl - tgl/5) %>%
+  rename(Chol = tc, HDL = hdl, TG = tgl, LDL = ldl, Age = Age...Calculated)
+
+match_df <- data.frame(id = c(clinical_data$record_id, chimp_clinical$Study.ID),
+                       cohort = c(rep("bioheart", nrow(clinical_data)), rep("chimp", nrow(chimp_clinical))),
+                       Chol = c(clinical_data$Chol, chimp_clinical$Chol),
+                       LDL = c(clinical_data$LDL, chimp_clinical$LDL)) %>%
+  column_to_rownames("id") %>%
+  drop_na()
+
+matched <- matchit(cohort ~ Chol + LDL, data = match_df, method = "nearest", distance = "scaled_euclidean")
+matched_ids <- matched$match.matrix[,1]
+matched_ids
+
+# areas_matched_inds <- which(rownames(bioheart_BIO) %in% matched_ids)
+# bioheart_BIO <- bioheart_BIO[areas_matched_inds,]
+# bioheart_BIO_totals <- bioheart_BIO_totals[areas_matched_inds,]
+# bioheart_SampleData <- bioheart_SampleData[areas_matched_inds,]
+# clinical_data <- clinical_data %>% filter(record_id %in% matched_ids)
+```
+
+
+# Table 1 {.tabset}
+
+## Human
+
+```{r}
+clinical_data %>%
+mutate(gender = factor(gender, levels = 1:2, labels = c("Male", "Female")),
+       cacs = as.numeric(cacs),
+       cacs_bin = cacs > 0,
+       cacs_log = log2(cacs+1),
+       cacs_pct = as.numeric(cacs_pct),
+       gensini = as.numeric(gensini),
+       gensini_bin = gensini>0,
+       gensini_log = log2(gensini+1),
+       sps = as.numeric(sps_d),
+       sps_log = log2(sps+1),
+       sps_bin = sps > 0,
+       Chol = Chol/38.67, 
+       HDL = HDL/38.67, 
+       TG = TG/38.67, 
+       LDL = LDL/38.67) %>%
+  rename(Sex = gender,
+         Age = age,
+         FRS = ascvd_10y_frs,
+         `CACS positive` = cacs_bin,
+         `Gensini positive` = gensini_bin) %>%
+select(Sex, Age, FRS, `CACS positive`,`Gensini positive`, Chol, HDL, TG, LDL) %>%
+table1(~ ., data = .)
+```
+
+## Human CAD
+
+```{r}
+clinical_data %>%
+mutate(gender = factor(gender, levels = 1:2, labels = c("Male", "Female")),
+       cacs = as.numeric(cacs),
+       cacs_bin = cacs > 0,
+       cacs_log = log2(cacs+1),
+       cacs_pct = as.numeric(cacs_pct),
+       gensini = as.numeric(gensini),
+       gensini_bin = gensini>0,
+       gensini_log = log2(gensini+1),
+       sps = as.numeric(sps_d),
+       sps_log = log2(sps+1),
+       sps_bin = sps > 0,
+       Chol = Chol/38.67, 
+       HDL = HDL/38.67, 
+       TG = TG/38.67, 
+       LDL = LDL/38.67) %>%
+  filter(cacs > 0) %>%
+  rename(Sex = gender,
+         Age = age,
+         FRS = ascvd_10y_frs,
+         `CACS positive` = cacs_bin,
+         `Gensini positive` = gensini_bin) %>%
+select(Sex, Age, FRS, Chol, HDL, TG, LDL) %>%
+table1(~ ., data = .)
+```
+
+## Human no CAD
+
+```{r}
+clinical_data %>%
+mutate(gender = factor(gender, levels = 1:2, labels = c("Male", "Female")),
+       cacs = as.numeric(cacs),
+       cacs_bin = cacs > 0,
+       cacs_log = log2(cacs+1),
+       cacs_pct = as.numeric(cacs_pct),
+       gensini = as.numeric(gensini),
+       gensini_bin = gensini>0,
+       gensini_log = log2(gensini+1),
+       sps = as.numeric(sps_d),
+       sps_log = log2(sps+1),
+       sps_bin = sps > 0,
+       Chol = Chol/38.67, 
+       HDL = HDL/38.67, 
+       TG = TG/38.67, 
+       LDL = LDL/38.67) %>%
+  filter(cacs == 0) %>%
+  rename(Sex = gender,
+         Age = age,
+         FRS = ascvd_10y_frs,
+         `CACS positive` = cacs_bin,
+         `Gensini positive` = gensini_bin) %>%
+select(Sex, Age, FRS, Chol, HDL, TG, LDL) %>%
+table1(~ ., data = .)
+```
+
+## Chimp
+
+```{r}
+chimp_clinical %>%
+  select(Sex, Age, Chol, HDL, TG, LDL) %>%
+  table1(~ ., data = .)
+```
+
+# Chimp vs human comparison {.tabset}
+
+## DE analysis {.tabset}
+
+### limma species
+
+```{r}
+combined <- rbind(bioheart_BIO, chimp_BIO) %>% t %>% log2
+f <- c(rep("bioheart", nrow(bioheart_BIO)), rep("chimp", nrow(chimp_BIO)))
+design<- model.matrix(~ f)
+limma.fit <- lmFit(combined, design)
+limma.fit <- eBayes(limma.fit)
+DEresults <- topTable(limma.fit, number = Inf, sort.by = "p")
+DEresults.rounded <- signif(DEresults,4)
+DEresults.rounded[,4] <- sapply(DEresults.rounded[,4], format, scientific = TRUE)
+DT::datatable(DEresults.rounded)
+```
+
+```{r, eval = FALSE}
+### outputing table
+bioheart_means <- bioheart_BIO %>% colMeans %>% log2
+chimp_means <- chimp_BIO %>% colMeans %>% log2
+
+combined_means <- data.frame(bioheart = bioheart_means, chimp = chimp_means, analyte = names(bioheart_means))
+
+output <- DEresults %>% 
+  rownames_to_column("analyte") %>%
+  left_join(combined_means, by = "analyte") %>%
+  mutate(analyte_clean = plyr::mapvalues(analyte,
+                                         from = lipid_mapping$clean_names,
+                                         to = lipid_mapping$final_names,
+                                         warn_missing = FALSE)) %>%
+  select(analyte_clean, bioheart, chimp, logFC, t, P.Value, adj.P.Val) %>%
+  arrange(analyte_clean) %>%
+  mutate_if(is.numeric, signif, 4) %>%
+  rename(`Lipid species` = analyte_clean,
+         `Bioheart average (log)`= bioheart,
+         `Chimpanzee average (log)` = chimp,
+         `Log Fold Change` = logFC,
+         `Test statistic` = t,
+         `p value` = P.Value,
+         `Adjusted p value` = adj.P.Val)
+
+write.csv(output, "Manuscript/DE_results.csv", quote = FALSE, row.names = FALSE)
+```
+
+
+### MA plot
+
+```{r}
+## MA plot
+DEresults %>% 
+  rownames_to_column("species") %>%
+  mutate(class = plyr::mapvalues(species,
+                                 from = class_mapping$analyte,
+                                 to = class_mapping$Metabolite_Class)) %>%
+    plot_ly(x = ~AveExpr, 
+            y = ~logFC,
+            color = ~class, 
+            type = "scatter", 
+            mode = "markers",
+            text = ~paste("Lipid: ", species, '<br>AveExpr:', round(AveExpr,4),'<br>LogFC:', round(logFC,4)),
+            hoverinfo = 'text') %>% 
+            layout(title ="MA plot with Significant DE genes") 
+
+DEresults %>% 
+  mutate(sig = adj.P.Val < 0.05,
+         sig = plyr::mapvalues(sig, from = c(TRUE, FALSE), to = c("Significant", "Normal"))) %>%
+  rownames_to_column("species") %>%
+    plot_ly(x = ~AveExpr, 
+            y = ~logFC,
+            color = ~sig, 
+            type = "scatter", 
+            mode = "markers",
+            text = ~paste("Lipid: ", species, '<br>AveExpr:', round(AveExpr,4),'<br>LogFC:', round(logFC,4)),
+            hoverinfo = 'text') %>% 
+            layout(title ="MA plot with Significant DE genes") 
+```
+
+
+
+### Volcano plot
+
+
+```{r}
+## volcano plot
+DEresults %>% 
+  rownames_to_column("species") %>%
+  mutate(class = plyr::mapvalues(species,
+                                 from = class_mapping$analyte,
+                                 to = class_mapping$Metabolite_Class)) %>%
+    plot_ly(x = ~logFC, 
+      y = ~-log10(P.Value),
+            color = ~class, 
+            type = "scatter", 
+            mode = "markers",
+            text = ~paste("Lipid: ", species, '<br>logFC:', round(logFC,4),'<br>P.Value:', round(P.Value,4)),
+            hoverinfo = 'text') %>% 
+            layout(title ="Volcano plot with Significant DE genes") 
+
+DEresults %>% 
+  mutate(sig = adj.P.Val < 0.05,
+         sig = plyr::mapvalues(sig, from = c(TRUE, FALSE), to = c("Significant", "Normal"))) %>%
+  rownames_to_column("species") %>%
+    plot_ly(x = ~logFC, 
+      y = ~-log10(P.Value),
+            color = ~sig, 
+            type = "scatter", 
+            mode = "markers",
+            text = ~paste("Lipid: ", species, '<br>logFC:', round(logFC,4),'<br>P.Value:', round(P.Value,4)),
+            hoverinfo = 'text') %>% 
+            layout(title ="Volcano plot with Significant DE genes")
+```
+
+## limma totals
+
+```{r}
+combined_totals <- rbind(bioheart_BIO_totals, chimp_BIO_totals) %>% t %>% log2
+f <- c(rep("bioheart", nrow(bioheart_BIO_totals)), rep("chimp", nrow(chimp_BIO_totals)))
+design<- model.matrix(~ f)
+limma.fit <- lmFit(combined_totals, design)
+limma.fit <- eBayes(limma.fit)
+DEresults_totals <- topTable(limma.fit, number = Inf, sort.by = "p")
+DEresults_totals.rounded <- signif(DEresults_totals,4)
+DEresults_totals.rounded[,4] <- sapply(DEresults_totals.rounded[,4], format, scientific = TRUE)
+DT::datatable(DEresults_totals.rounded)
+```
+
+
+# Lipid sets enrichment analysis {.tabset}
+
+## set up {.tabset}
+
+### reading in 
+
+```{r}
+lipid_sets_data <- read.csv("data/lipid_LSEA.csv", header = FALSE)
+lipid_sets_mat <- t(lipid_sets_data)
+```
+
+```{r}
+lipid_sets_categories <- lipid_sets_mat[1,]
+lipid_sets_names <- lipid_sets_mat[2,]
+
+table(lipid_sets_categories)
+# lipid_sets_names
+```
+
+```{r}
+lipid_sets <- list()
+for(i in 1:ncol(lipid_sets_mat)){
+  lipid_list <- lipid_sets_mat[3:nrow(lipid_sets_mat),i]
+  lipid_list <- lipid_list[nzchar(lipid_list)]
+  lipid_list <- janitor::make_clean_names(lipid_list)
+  lipid_list <- lipid_list[lipid_list %in% class_mapping$analyte]
+  lipid_sets[[i]] <- lipid_list 
+}
+```
+
+```{r}
+keep_sets <- which(sapply(lipid_sets, function(x) length(x) > 0))
+lipid_sets <- lipid_sets[keep_sets]
+lipid_sets_categories <- lipid_sets_categories[keep_sets]
+lipid_sets_names <- lipid_sets_names[keep_sets]
+```
+
+### checking and filtering
+
+```{r}
+sum(class_mapping$analyte %in% unlist(lipid_sets))
+setdiff(class_mapping$analyte, unlist(lipid_sets))
+```
+
+```{r}
+table(lipid_sets_categories)
+```
+
+```{r}
+check_means_category <- function(bioheart_data, chimp_data, category){
+  bioheart_long <- bioheart_data %>% 
+  mutate(sampleID = rownames(bioheart_data)) %>%
+  pivot_longer(cols = -"sampleID", names_to = "species", values_to  = "Value") %>%
+  mutate(cohort = "bioheart")
+
+chimp_long <- chimp_data %>% 
+  mutate(sampleID = rownames(chimp_data)) %>%
+  pivot_longer(cols = -"sampleID", names_to = "species", values_to  = "Value") %>%
+  mutate(cohort = "chimp")
+
+category_id <- which(lipid_sets_names == category)
+category_lipids <- lipid_sets[[category_id]]
+
+combined_long <- rbind(bioheart_long, chimp_long) %>% 
+  mutate(cohort = factor(cohort, levels = c("bioheart", "chimp"))) %>%
+  filter(species %in% category_lipids) %>%
+      mutate(species = plyr::mapvalues(species, 
+                                 from = lipid_mapping$clean_names, 
+                                 to = lipid_mapping$final_names, 
+                                 warn_missing = F))
+
+    bioheart_means <- combined_long %>% filter(cohort == "bioheart") %>% group_by(species) %>% summarise(means = mean(Value)) %>% arrange(species) %>% pull(means)
+    chimp_means <- combined_long %>% filter(cohort == "chimp") %>% group_by(species) %>% summarise(means = mean(Value)) %>% arrange(species) %>% pull(means)
+    bioheart_sds <- combined_long %>% filter(cohort == "bioheart") %>% group_by(species) %>% summarise(sds = sd(log2(Value))) %>% arrange(species) %>% pull(sds)
+    chimp_sds <- combined_long %>% filter(cohort == "chimp") %>% group_by(species) %>% summarise(sds = sd(log2(Value))) %>% arrange(species) %>% pull(sds)
+    n_bioheart <- nrow(bioheart_data)
+    n_chimp <- nrow(chimp_data)
+    pooled_sd <- ((n_bioheart - 1) * bioheart_sds + (n_chimp - 1) * chimp_sds)/(n_bioheart + n_chimp - 2)
+    
+    lipid_species_order <- sort(unique(combined_long$species))[order(bioheart_means/chimp_means)]
+
+data.frame(species = sort(unique(combined_long$species)),
+                      bioheart_means = bioheart_means,
+                      chimp_means = chimp_means,
+                      diff = log2(bioheart_means) - log2(chimp_means),
+                      sd = pooled_sd) %>%  
+  mutate(species = factor(species, levels = rev(lipid_species_order)),
+         colour = factor(sign(diff))) %>%
+  ggplot(aes(x = species, y = diff, fill = colour)) + 
+    geom_bar(stat = "identity") +
+    geom_pointrange(aes(x=species, ymin=diff-sd, ymax=diff+sd), alpha=0.9, size = 0.3) + 
+    geom_hline(yintercept = 0) +
+    theme_bw() +  
+    ggtitle(paste("Human vs Chimp Comparison of", category)) +
+    ylab("Log 2 Fold Change") +
+    xlab("Lipid Species") +
+    theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank(),
+        legend.position = "none",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  scale_fill_manual(values = c("1" = "firebrick1", "-1" = "dodgerblue1"))
+}
+```
+
+```{r}
+human_means <- bioheart_BIO %>% log2 %>% colMeans
+chimp_means <- chimp_BIO %>% log2 %>% colMeans
+species_fc <- chimp_means - human_means
+```
+
+## Camera LSEA {.tabset}
+
+```{r}
+DEresults_alphabetical <- DEresults[order(rownames(DEresults)),] 
+identical(rownames(DEresults_alphabetical), class_mapping$analyte)
+
+camera_LSEA <- function(group){
+  species_list_ids <- list()
+  avg_log_fc <- c()
+  lipid_set_category_ids <- which(lipid_sets_categories == group)
+  
+  for(i in 1:length(lipid_set_category_ids)){
+    lipid_set_analytes <- lipid_sets[[lipid_set_category_ids[i]]]
+    species_list_ids[[i]] <- which(class_mapping$analyte %in% lipid_set_analytes)
+    avg_log_fc <- c(avg_log_fc, mean(species_fc[lipid_set_analytes]))
+  }
+  names(species_list_ids) <- lipid_sets_names[lipid_set_category_ids]
+  names(avg_log_fc) <- lipid_sets_names[lipid_set_category_ids]
+  avg_log_fc <- avg_log_fc[order(janitor::make_clean_names(names(avg_log_fc)))]
+  
+  camera_result <- cameraPR(DEresults_alphabetical$t, species_list_ids)
+  camera_result <- camera_result %>%
+    rownames_to_column("Set") %>%
+    arrange(toupper(Set)) %>%
+    mutate(neg_log10_PValue_signed = -log10(FDR) * as.numeric(ifelse(Direction == "Up", "1", "-1")),
+           PValue = formatC(signif(PValue,4), format = "e"),
+           FDR = formatC(signif(FDR,4), format = "e"),
+           neg_log10_PValue_signed = signif(neg_log10_PValue_signed,4),
+           avg_log_fc = signif(avg_log_fc,4),
+           avg_fc_signed = signif(2^abs(avg_log_fc) * sign(avg_log_fc),4)) %>% 
+    arrange(neg_log10_PValue_signed)
+  return(camera_result)
+}
+```
+
+
+### Class
+
+```{r}
+camera_result <- camera_LSEA("Class") 
+camera_result %>% DT::datatable()
+```
+
+```{r, eval = FALSE}
+### outputing table
+output <- camera_result %>%
+  mutate(Set = sub("Class - ", "", Set)) %>% 
+  arrange(Set) %>%
+  rename(`Group size` = NGenes,
+         `p value` = PValue,
+         `Average Log Fold Change` = avg_log_fc,
+         `Signed Fold Change` = avg_fc_signed) %>%
+  mutate_if(is.numeric, signif, 4)
+
+write.csv(output, "Manuscript/class_enrichment_results.csv", quote = TRUE, row.names = FALSE)
+```
+
+### Domain
+
+```{r}
+camera_result <- camera_LSEA("Domain") 
+camera_result %>% DT::datatable()
+```
+
+
+```{r}
+check_means_category(bioheart_BIO, chimp_BIO, "Domain - Sphingolipids")
+check_means_category(bioheart_BIO, chimp_BIO, "Domain - Fatty acids")
+check_means_category(bioheart_BIO, chimp_BIO, "Domain - Glycerophospholipids")
+```
+
+
+### Feature
+
+```{r}
+camera_result <- camera_LSEA("Feature") 
+camera_result %>% DT::datatable()
+```
+
+```{r}
+check_means_category(bioheart_BIO, chimp_BIO, "Feature - d16:1 base")
+check_means_category(bioheart_BIO, chimp_BIO, "Feature - Fatty acid 17:1")
+check_means_category(bioheart_BIO, chimp_BIO, "Feature - d19:1 base")
+check_means_category(bioheart_BIO, chimp_BIO, "Feature - Fatty acid 18:3")
+check_means_category(bioheart_BIO, chimp_BIO, "Feature - P-15:0")
+check_means_category(bioheart_BIO, chimp_BIO, "Feature - P-16:0")
+```
+
+
+```{r}
+check_means_category(bioheart_BIO, chimp_BIO, "Feature - Fatty acid 18:3")
+check_means_category(bioheart_BIO, chimp_BIO, "Feature - Fatty acid 20:2")
+check_means_category(bioheart_BIO, chimp_BIO, "Feature - Fatty acid 22:5")
+check_means_category(bioheart_BIO, chimp_BIO, "Feature - Fatty acid 17:1")
+check_means_category(bioheart_BIO, chimp_BIO, "Feature - Fatty acid 16:1")
+check_means_category(bioheart_BIO, chimp_BIO, "Feature - Fatty acid 19:0")
+```
+
+```{r, eval = FALSE}
+### outputing table
+output <- camera_result %>%
+  mutate(Set = sub("Feature - ", "", Set)) %>% 
+  arrange(Set) %>%
+  rename(`Group size` = NGenes,
+         `p value` = PValue,
+         `Average Log Fold Change` = avg_log_fc,
+         `Signed Fold Change` = avg_fc_signed) %>%
+  mutate_if(is.numeric, signif, 4)
+
+write.csv(output, "Manuscript/chain_enrichment_results.csv", quote = TRUE, row.names = FALSE)
+```
+
+### Subclass
+
+```{r}
+camera_result <- camera_LSEA("Subclass") 
+camera_result %>% DT::datatable()
+```
+
+```{r}
+check_means_category(bioheart_BIO, chimp_BIO, "Subclass - Plasmalogen")
+check_means_category(bioheart_BIO, chimp_BIO, "Subclass - Ether lipid")
+```
+
+
+# Differential abundance with CAD {.tabset}
+
+## CACS
+
+```{r}
+identical(rownames(bioheart_BIO), as.character(clinical_data$record_id))
+identical(rownames(bioheart_BIO_totals), as.character(clinical_data$record_id))
+
+all_data <- cbind(clinical_data, log2(bioheart_BIO), log2(bioheart_BIO_totals))
+all_lipid_list <- c(colnames(bioheart_BIO), colnames(bioheart_BIO_totals))
+n_lipids <- length(all_lipid_list)
+
+lipid_coef <- c()
+lipid_stderror <- c()
+lipid_pval <- c()
+
+for(i in 1:n_lipids){
+  species_name <- all_lipid_list[i]
+  model <-  all_data %>%
+    select(cacs_bin, all_of(species_name), age, gender, bmi, cvhx_dm, cvhx_hcl_sr, curr_smok, cvhx_htn) %>%
+    drop_na() %>%
+    glm(cacs_bin ~  ., ., family = "binomial") %>%
+    summary()
+  lipid_coef <- c(lipid_coef, model$coefficients[2,1])
+  lipid_stderror <- c(lipid_stderror, model$coefficients[2,2])
+  lipid_pval <- c(lipid_pval, model$coefficients[2,4])
+}
+
+logistic_results <- data.frame(species_name = all_lipid_list,
+                      coef = lipid_coef,
+                      stderror = lipid_stderror,
+                      pval = lipid_pval,
+                      p_values_adj = p.adjust(lipid_pval, method = "BH")) %>%
+  mutate(OR = exp(coef)) %>%
+  arrange(pval)
+
+logistic_results %>% mutate_if(is.numeric, signif, digits = 4) %>% DT::datatable()
+```
+
+## Gensini
+
+```{r}
+identical(rownames(bioheart_BIO), as.character(clinical_data$record_id))
+identical(rownames(bioheart_BIO_totals), as.character(clinical_data$record_id))
+
+all_data <- cbind(clinical_data, log2(bioheart_BIO), log2(bioheart_BIO_totals))
+all_lipid_list <- c(colnames(bioheart_BIO), colnames(bioheart_BIO_totals))
+n_lipids <- length(all_lipid_list)
+
+lipid_coef <- c()
+lipid_stderror <- c()
+lipid_pval <- c()
+
+for(i in 1:n_lipids){
+  species_name <- all_lipid_list[i]
+  model <-  all_data %>%
+    select(gensini_bin, all_of(species_name), age, gender, bmi, cvhx_dm, cvhx_hcl_sr, curr_smok, cvhx_htn) %>%
+    drop_na() %>%
+    glm(gensini_bin ~  ., ., family = "binomial") %>%
+    summary()
+  lipid_coef <- c(lipid_coef, model$coefficients[2,1])
+  lipid_stderror <- c(lipid_stderror, model$coefficients[2,2])
+  lipid_pval <- c(lipid_pval, model$coefficients[2,4])
+}
+
+logistic_results <- data.frame(species_name = all_lipid_list,
+                      coef = lipid_coef,
+                      stderror = lipid_stderror,
+                      pval = lipid_pval,
+                      p_values_adj = p.adjust(lipid_pval, method = "BH")) %>%
+  mutate(OR = exp(coef)) %>%
+  arrange(pval)
+
+logistic_results %>% mutate_if(is.numeric, signif, digits = 4) %>% DT::datatable()
+```
+
+
+
+# Chimp Signature analysis {.tabset}
+
+## calculate pca
+```{r}
+combined_bc <- log2(rbind(bioheart_BIO, chimp_BIO))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+```
+
+## PRS scores
+
+```{r}
+PRS_scores <- read.table("data/bioheart/aggregated_scores.txt", sep = "\t", header = TRUE)
+```
+
+```{r}
+table(PRS_scores$PGS)
+```
+
+```{r}
+PRS_df <- PRS_scores %>% 
+  filter(PGS == "PGS000010") %>%
+  mutate(record_id = plyr::mapvalues(IID, 
+                                     from = genetics_mapping$geneticsID, 
+                                     to = genetics_mapping$record_id,
+                                     warn_missing = FALSE),
+         record_id = as.numeric(record_id),
+         PRS = SUM) %>%
+  select(record_id, PRS)
+clinical_data <- clinical_data %>% left_join(PRS_df, by = "record_id")
+```
+
+
+## define functions
+
+```{r}
+pvalue <- function(x, ...) {
+    y <- unlist(x)
+    g <- factor(rep(1:length(x), times=sapply(x, length)))
+    if (is.numeric(y)) {
+        p <- t.test(y ~ g)$p.value
+    } else {
+        p <- chisq.test(table(y, g))$p.value
+    }
+    c("", sub("<", "&lt;", format.pval(p, digits=3, eps=0.001)))
+}
+
+find_closest_humans_topn <- function(dist_mat, n){
+  dist_mat %>% 
+  data.frame() %>% 
+  rownames_to_column(var = "human") %>%
+  pivot_longer(cols = -"human", names_to = "chimp", values_to = "cor") %>%
+  arrange(cor) %>%
+  group_by(chimp) %>%
+  slice(1:n) %>%
+  pull(human) %>%
+  unique()
+}
+
+find_closest_humans_toppercent <- function(dist_mat, p){
+  dist_mat %>% 
+  data.frame() %>% 
+  rownames_to_column(var = "human") %>%
+  pivot_longer(cols = -"human", names_to = "chimp", values_to = "cor") %>%
+  group_by(human) %>%
+  summarise(min_dst = min(cor)) %>%
+  arrange(min_dst) %>%
+  slice(1:round(nrow(mahalanobis_dist_mat) * p)) %>%
+  pull(human)
+}
+
+visualise_closest_humans <- function(closest_humans){
+  df_pca %>% 
+  mutate(closest_human = FALSE,
+  closest_human = ifelse(batch == "chimp", "chimp", closest_human),
+  closest_human = ifelse(record_id %in% closest_humans, "TRUE", closest_human)) %>%
+  ggplot(aes(x = PC1, y = PC2, colour = closest_human)) +
+    geom_point() +
+    scale_colour_manual(values = c("firebrick3", "grey", "dodgerblue3")) +
+    xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+    ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+    ggtitle("PCA visualisation") +
+    theme_bw() 
+}
+
+table1_closest_humans <- function(closest_humans){
+  clinical_data %>%
+  mutate(closest = ifelse(record_id %in% closest_humans, "Chimp Signature", "Non-chimp Signature"),
+         gender = factor(gender, levels = 1:2, labels = c("Male", "Female")),
+         cvhx_dm = factor(cvhx_dm),
+         cvhx_htn = factor(cvhx_htn),
+         smoking_status = factor(smoking_status, 
+                                 levels = 1:3, 
+                                 labels = c("Current Smoker", "Never Smoked", "Ex-Smoker")),
+         statin = factor(statin),
+         cacs = as.numeric(cacs),
+         cacs_bin = cacs > 0,
+         cacs_log = log2(cacs+1),
+         cacs_pct = as.numeric(cacs_pct),
+         gensini = as.numeric(gensini),
+         gensini_bin = gensini>0,
+         gensini_log = log2(gensini+1),
+         sps = as.numeric(sps_d),
+         sps_log = log2(sps+1),
+         sps_bin = sps > 0) %>%
+    rename(`CACS (log scale)` = cacs_log,
+           `CACS positive` = cacs_bin,
+           `CACS percentile` = cacs_pct,
+           `Gensini (log scale)` = gensini_log,
+           `Gensini positive` = gensini_bin,
+           `Soft plaque score (log scale)` = sps_log,
+           `Soft plaque positive` = sps_bin,
+           `Soft plaque ratio` = sps_ratio) %>%
+  select(closest, `CACS (log scale)`, `CACS positive`, `CACS percentile`, `Gensini (log scale)`, `Gensini positive`, `Soft plaque score (log scale)`, `Soft plaque positive`, `Soft plaque ratio`) %>%
+  drop_na() %>%
+  table1(~ . | closest, data = ., overall=F, extra.col=list(`P-value`=pvalue))
+}
+```
+
+## Define chimp signature humans
+
+```{r}
+library(pracma)
+pca_human = prcomp(log2(bioheart_BIO), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+visualise_closest_humans(closest_humans)
+table1_closest_humans(closest_humans)
+```
+
+## Resilience
+
+```{r, eval = F}
+resilience_df <- read.csv("data/bioheart/resilience.csv") 
+clinical_data %>%
+  left_join(resilience_df, by = "record_id") %>%
+mutate(closest = ifelse(record_id %in% closest_humans, "Chimp Signature", "Non-chimp Signature"),
+       ) %>%
+select(closest, cacs_riskscorecond_pct, ascvd_10y_frs.y, ascvd_10y_accaha, chd_10y_mesa, SCORE2, SCORE2_new) %>%
+drop_na() %>%
+table1(~ . | closest, data = ., overall=F, extra.col=list(`P-value`=pvalue))
+```
+
+
+
+## comparing CAD outcomes across sig {.tabset}
+
+### cacs log
+
+```{r}
+clinical_data %>%
+  mutate(closest = ifelse(record_id %in% closest_humans, "Chimp Signature", "Non-chimp Signature")) %>%
+  ggplot(aes(x = closest, y = cacs_log)) +
+  geom_boxplot() + 
+  theme_bw()
+```
+
+### gensini log
+
+```{r}
+clinical_data %>%
+  mutate(closest = ifelse(record_id %in% closest_humans, "Chimp Signature", "Non-chimp Signature")) %>%
+  ggplot(aes(x = closest, y = gensini_log)) +
+  geom_boxplot() + 
+  theme_bw()
+```
+
+## cacs_log summary stats
+```{r}
+clinical_data %>% lm(cacs_log ~ distance, data = .) %>% summary
+clinical_data %>% lm(cacs_log ~ distance + gender, data = .) %>% summary
+clinical_data %>% lm(cacs_log ~ distance + age, data = .) %>% summary
+clinical_data %>% lm(cacs_log ~ distance + gender + age, data = .) %>% summary
+```
+
+## cacs_bin summary stats
+```{r}
+clinical_data %>% glm(cacs_bin ~  distance, ., family = "binomial") %>% summary
+clinical_data %>% glm(cacs_bin ~  distance + gender, ., family = "binomial") %>% summary
+clinical_data %>% glm(cacs_bin ~  distance + age, ., family = "binomial") %>% summary
+clinical_data %>% glm(cacs_bin ~  distance + gender + age, ., family = "binomial") %>% summary
+clinical_data %>% glm(cacs_bin ~  distance + gender + age + cvhx_dm + cvhx_htn + cvhx_hcl_sr + curr_smok, ., family = "binomial") %>% summary
+clinical_data %>% glm(cacs_bin ~  distance + gender + age + bmi + cvhx_dm + cvhx_htn + cvhx_hcl_sr + curr_smok, ., family = "binomial") %>% summary
+```
+
+## cacs_pct summary stats
+```{r}
+clinical_data %>% lm(cacs_pct ~ distance, data = .) %>% summary
+clinical_data %>% lm(cacs_pct ~ distance + gender, data = .) %>% summary
+clinical_data %>% lm(cacs_pct ~ distance + age, data = .) %>% summary
+clinical_data %>% lm(cacs_pct ~ distance + gender + age, data = .) %>% summary
+clinical_data %>% lm(cacs_pct ~ distance + gender + age + cvhx_dm + cvhx_htn + cvhx_hcl_sr + curr_smok, data = .) %>% summary
+```
+
+## Forest plot {.tabset}
+
+### All variables
+```{r}
+glm_df <- clinical_data %>% 
+  mutate(Distance = scale(distance),
+         Age = scale(age),
+         Sex = 2-gender,
+         BMI = scale(bmi),
+         Diabetes = cvhx_dm,
+         Hypertension = cvhx_htn,
+         Hypercholesterolemia = cvhx_hcl_sr,
+         Smoking = curr_smok,
+         CAD = cacs_bin) %>%
+  select(CAD, Distance, Age, Sex, BMI, Diabetes, Hypertension, Hypercholesterolemia, Smoking)
+
+model <- glm(CAD ~  . , glm_df, family = "binomial") %>% summary
+model
+
+coefs <- model$coefficients[-1,1]
+stderrors <- model$coefficients[-1,2]
+pvals <- model$coefficients[-1,4]
+
+results <- data.frame(var_name = names(coefs),
+                      coef = signif(coefs,4),
+                      stderror = signif(stderrors,4),
+                      pval = signif(pvals,4),
+                      p_values_adj = signif(p.adjust(pvals, method = "BH"),4)) %>%
+    mutate(OR = exp(coef),
+           OR_lower = exp(coef + qnorm(0.025) * stderror),
+           OR_upper = exp(coef + qnorm(0.975) * stderror)) %>%
+    mutate(signif_lvl = case_when(
+      pval < 0.001 ~ "***",
+      pval < 0.01 ~ "**",
+      pval < 0.05 ~ "*",
+      pval < 0.1 ~ "\U00B0",
+      TRUE ~ ""
+    )) %>%
+    arrange(pval)
+
+dist_number <- which(results %>% arrange(-pval) %>% pull(var_name) == "Distance")
+
+results %>%
+  mutate(var_name = factor(var_name, levels = c(var_name[order(-pval)][-dist_number], "Distance")),
+         dist_var = factor(ifelse(var_name == "Distance", "Distance", "Other"))) %>%
+  ggplot(aes(y=var_name)) +
+  geom_point(aes(x=OR, colour = dist_var), position=position_dodge(width=0.5)) +
+  geom_vline(aes(xintercept = 1), linetype="dotted", colour = "red") +
+  geom_errorbarh(aes(colour = dist_var, xmin=OR_lower, xmax=OR_upper, 
+                     height = 0.25), 
+                 position=position_dodge(width=0.5),
+                 alpha=0.75) +
+  geom_text(aes(x=Inf, label=signif_lvl), 
+                 position=position_dodge(width=0.5),
+            hjust=0, vjust=0.75,
+            size=6, show.legend = FALSE) +
+  theme_bw() +
+  theme(strip.background = element_rect(colour = NA, fill="grey90"),
+        legend.position = "bottom",
+        plot.margin = unit(c(1,2,1,1), "lines"),
+        text = element_text(size = 16)) +
+    coord_cartesian(clip = 'off') +
+  labs(title="",
+       y="",
+       x="Odds Ratio (95% CI)")+ 
+  guides(colour="none") +
+scale_colour_manual(values = c("Distance" = "forestgreen", "Other" = "navy")) +
+  scale_x_continuous(breaks = c(1,2,4,6,8)) + 
+  scale_y_discrete(labels = c("Distance" = "Mahalanobis Distance"))
+```
+
+### Exclude Age and Sex
+
+```{r}
+results %>%
+  filter(!var_name %in% c("Age", "Sex")) %>%
+  mutate(var_name = factor(var_name, levels = c(var_name[order(-pval)][-dist_number], "Distance")),
+         dist_var = factor(ifelse(var_name == "Distance", "Distance", "Other"))) %>%
+  ggplot(aes(y=var_name)) +
+  geom_point(aes(x=OR, colour = dist_var), position=position_dodge(width=0.5)) +
+  geom_vline(aes(xintercept = 1), linetype="dotted", colour = "red") +
+  geom_errorbarh(aes(colour = dist_var, xmin=OR_lower, xmax=OR_upper, 
+                     height = 0.25), 
+                 position=position_dodge(width=0.5),
+                 alpha=0.75) +
+  geom_text(aes(x=Inf, label=signif_lvl), 
+                 position=position_dodge(width=0.5),
+            hjust=0, vjust=0.75,
+            size=6, show.legend = FALSE) +
+  theme_bw() +
+  theme(strip.background = element_rect(colour = NA, fill="grey90"),
+        legend.position = "bottom",
+        plot.margin = unit(c(1,2,1,1), "lines"),
+        text = element_text(size = 16)) +
+    coord_cartesian(clip = 'off') +
+  labs(title="",
+       y="",
+       x="Odds Ratio (95% CI)")+ 
+  guides(colour="none") +
+scale_colour_manual(values = c("Distance" = "forestgreen", "Other" = "navy")) +
+  scale_x_continuous(breaks = c(1,2,4,6,8)) + 
+  scale_y_discrete(labels = c("Distance" = "Mahalanobis Distance"))
+```
+
+### Under 60
+```{r, eval = F}
+glm_df <- clinical_data %>% 
+  filter(age < 60) %>%
+  mutate(Distance = scale(distance),
+         Age = scale(age),
+         Sex = 2-gender,
+         BMI = scale(bmi),
+         Diabetes = cvhx_dm,
+         Hypertension = cvhx_htn,
+         Hypercholesterolemia = cvhx_hcl_sr,
+         Smoking = curr_smok,
+         CAD = cacs_bin) %>%
+  select(CAD, Distance, Age, Sex, BMI, Diabetes, Hypertension, Hypercholesterolemia, Smoking)
+
+model <- glm(CAD ~  . , glm_df, family = "binomial") %>% summary
+model
+
+coefs <- model$coefficients[-1,1]
+stderrors <- model$coefficients[-1,2]
+pvals <- model$coefficients[-1,4]
+
+results <- data.frame(var_name = names(coefs),
+                      coef = signif(coefs,4),
+                      stderror = signif(stderrors,4),
+                      pval = signif(pvals,4),
+                      p_values_adj = signif(p.adjust(pvals, method = "BH"),4)) %>%
+    filter(!var_name %in% c("Age", "Sex")) %>%
+    mutate(OR = exp(coef),
+           OR_lower = exp(coef + qnorm(0.025) * stderror),
+           OR_upper = exp(coef + qnorm(0.975) * stderror)) %>%
+    mutate(signif_lvl = case_when(
+      pval < 0.001 ~ "***",
+      pval < 0.01 ~ "**",
+      pval < 0.05 ~ "*",
+      pval < 0.1 ~ "\U00B0",
+      TRUE ~ ""
+    )) %>%
+    arrange(pval)
+
+dist_number <- which(results %>% arrange(-pval) %>% pull(var_name) == "Distance")
+
+results %>%
+  mutate(var_name = factor(var_name, levels = c(var_name[order(-pval)][-dist_number], "Distance")),
+         dist_var = factor(ifelse(var_name == "Distance", "Distance", "Other"))) %>%
+  ggplot(aes(y=var_name)) +
+  geom_point(aes(x=OR, colour = dist_var), position=position_dodge(width=0.5)) +
+  geom_vline(aes(xintercept = 1), linetype="dotted", colour = "red") +
+  geom_errorbarh(aes(colour = dist_var, xmin=OR_lower, xmax=OR_upper, 
+                     height = 0.25), 
+                 position=position_dodge(width=0.5),
+                 alpha=0.75) +
+  geom_text(aes(x=Inf, label=signif_lvl), 
+                 position=position_dodge(width=0.5),
+            hjust=0, vjust=0.75,
+            size=6, show.legend = FALSE) +
+  theme_bw() +
+  theme(strip.background = element_rect(colour = NA, fill="grey90"),
+        legend.position = "bottom",
+        plot.margin = unit(c(1,2,1,1), "lines"),
+        text = element_text(size = 16)) +
+    coord_cartesian(clip = 'off') +
+  labs(title="",
+       y="",
+       x="Odds Ratio (95% CI)")+ 
+  guides(colour="none") +
+scale_colour_manual(values = c("Distance" = "forestgreen", "Other" = "navy")) +
+  scale_x_continuous(breaks = c(1,2,4,6,8)) + 
+  scale_y_discrete(labels = c("Distance" = "Mahalanobis Distance"))
+```
+
+
+### Smurfless
+```{r}
+glm_df <- clinical_data %>% 
+  filter(smurfs == 0) %>%
+  mutate(Distance = scale(distance),
+         Age = scale(age),
+         Sex = 2-gender,
+         BMI = scale(bmi),
+         Diabetes = cvhx_dm,
+         Hypertension = cvhx_htn,
+         Hypercholesterolemia = cvhx_hcl_sr,
+         Smoking = curr_smok,
+         CAD = cacs_bin) %>%
+  select(CAD, Distance, Age, Sex, BMI, Diabetes, Hypertension, Hypercholesterolemia, Smoking)
+
+model <- glm(CAD ~  . , glm_df, family = "binomial") %>% summary
+model
+
+coefs <- model$coefficients[-1,1]
+stderrors <- model$coefficients[-1,2]
+pvals <- model$coefficients[-1,4]
+
+results <- data.frame(var_name = names(coefs),
+                      coef = signif(coefs,4),
+                      stderror = signif(stderrors,4),
+                      pval = signif(pvals,4),
+                      p_values_adj = signif(p.adjust(pvals, method = "BH"),4)) %>%
+    filter(!var_name %in% c("Age", "Sex", "Smoking")) %>%
+    mutate(OR = exp(coef),
+           OR_lower = exp(coef + qnorm(0.025) * stderror),
+           OR_upper = exp(coef + qnorm(0.975) * stderror)) %>%
+    mutate(signif_lvl = case_when(
+      pval < 0.001 ~ "***",
+      pval < 0.01 ~ "**",
+      pval < 0.05 ~ "*",
+      pval < 0.1 ~ "\U00B0",
+      TRUE ~ ""
+    )) %>%
+    arrange(pval)
+
+dist_number <- which(results %>% arrange(-pval) %>% pull(var_name) == "Distance")
+
+results %>%
+  mutate(var_name = factor(var_name, levels = c(var_name[order(-pval)][-dist_number], "Distance")),
+         dist_var = factor(ifelse(var_name == "Distance", "Distance", "Other"))) %>%
+  ggplot(aes(y=var_name)) +
+  geom_point(aes(x=OR, colour = dist_var), position=position_dodge(width=0.5)) +
+  geom_vline(aes(xintercept = 1), linetype="dotted", colour = "red") +
+  geom_errorbarh(aes(colour = dist_var, xmin=OR_lower, xmax=OR_upper, 
+                     height = 0.25), 
+                 position=position_dodge(width=0.5),
+                 alpha=0.75) +
+  geom_text(aes(x=Inf, label=signif_lvl), 
+                 position=position_dodge(width=0.5),
+            hjust=0, vjust=0.75,
+            size=6, show.legend = FALSE) +
+  theme_bw() +
+  theme(strip.background = element_rect(colour = NA, fill="grey90"),
+        legend.position = "bottom",
+        plot.margin = unit(c(1,2,1,1), "lines"),
+        text = element_text(size = 16)) +
+    coord_cartesian(clip = 'off') +
+  labs(title="",
+       y="",
+       x="Odds Ratio (95% CI)")+ 
+  guides(colour="none") +
+scale_colour_manual(values = c("Distance" = "forestgreen", "Other" = "navy")) +
+  scale_x_continuous(breaks = c(1,2,4,6,8)) + 
+  scale_y_discrete(labels = c("Distance" = "Mahalanobis Distance"))
+```
+
+
+### CACS 75 percentile
+```{r}
+glm_df <- clinical_data %>% 
+  mutate(Distance = scale(distance),
+         Age = scale(age),
+         Sex = 2-gender,
+         BMI = scale(bmi),
+         Diabetes = cvhx_dm,
+         Hypertension = cvhx_htn,
+         Hypercholesterolemia = cvhx_hcl_sr,
+         Smoking = curr_smok,
+         CAD = cacs_pct > 75) %>%
+  select(CAD, Distance, BMI, Diabetes, Hypertension, Hypercholesterolemia, Smoking)
+
+model <- glm(CAD ~  . , glm_df, family = "binomial") %>% summary
+model
+
+coefs <- model$coefficients[-1,1]
+stderrors <- model$coefficients[-1,2]
+pvals <- model$coefficients[-1,4]
+
+results <- data.frame(var_name = names(coefs),
+                      coef = signif(coefs,4),
+                      stderror = signif(stderrors,4),
+                      pval = signif(pvals,4),
+                      p_values_adj = signif(p.adjust(pvals, method = "BH"),4)) %>%
+    filter(!var_name %in% c("Age", "Sex")) %>%
+    mutate(OR = exp(coef),
+           OR_lower = exp(coef + qnorm(0.025) * stderror),
+           OR_upper = exp(coef + qnorm(0.975) * stderror)) %>%
+    mutate(signif_lvl = case_when(
+      pval < 0.001 ~ "***",
+      pval < 0.01 ~ "**",
+      pval < 0.05 ~ "*",
+      pval < 0.1 ~ "\U00B0",
+      TRUE ~ ""
+    )) %>%
+    arrange(pval)
+
+dist_number <- which(results %>% arrange(-pval) %>% pull(var_name) == "Distance")
+
+results %>%
+  mutate(var_name = factor(var_name, levels = c(var_name[order(-pval)][-dist_number], "Distance")),
+         dist_var = factor(ifelse(var_name == "Distance", "Distance", "Other"))) %>%
+  ggplot(aes(y=var_name)) +
+  geom_point(aes(x=OR, colour = dist_var), position=position_dodge(width=0.5)) +
+  geom_vline(aes(xintercept = 1), linetype="dotted", colour = "red") +
+  geom_errorbarh(aes(colour = dist_var, xmin=OR_lower, xmax=OR_upper, 
+                     height = 0.25), 
+                 position=position_dodge(width=0.5),
+                 alpha=0.75) +
+  geom_text(aes(x=Inf, label=signif_lvl), 
+                 position=position_dodge(width=0.5),
+            hjust=0, vjust=0.75,
+            size=6, show.legend = FALSE) +
+  theme_bw() +
+  theme(strip.background = element_rect(colour = NA, fill="grey90"),
+        legend.position = "bottom",
+        plot.margin = unit(c(1,2,1,1), "lines"),
+        text = element_text(size = 16)) +
+    coord_cartesian(clip = 'off') +
+  labs(title="",
+       y="",
+       x="Odds Ratio (95% CI)")+ 
+  guides(colour="none") +
+scale_colour_manual(values = c("Distance" = "forestgreen", "Other" = "navy")) +
+  scale_x_continuous(breaks = c(1,2,4,6,8)) + 
+  scale_y_discrete(labels = c("Distance" = "Mahalanobis Distance"))
+```
+
+## compare with risk scores
+
+```{r}
+clinical_data %>%
+  ggplot(aes(x = distance, y = ascvd_10y_frs)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) + 
+  labs(x = "Distance", y = "FRS") +
+  theme_bw()
+```
+
+```{r}
+clinical_data %>%
+  ggplot(aes(x = distance, y = PRS)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) + 
+  labs(x = "Distance", y = "PRS") +
+  theme_bw()
+```
+
+
+
+
+# chimp signature scatter plots {.tabset}
+
+## cacs log scale
+```{r}
+clinical_data %>%
+  ggplot(aes(x = distance, y = cacs_log)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) + 
+  labs(x = "Distance", y = "CACS (log scale)") +
+  theme_bw()
+```
+
+```{r}
+clinical_data %>%
+  ggplot(aes(x = distance, y = cacs_log, colour = factor(gender))) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) + 
+  labs(x = "Distance", y = "CACS (log scale)") +
+  theme_bw()
+```
+
+```{r}
+clinical_data %>%
+  mutate(Sex = ifelse(gender == 1, "Male", "Female"),
+         CAD = ifelse(cacs_bin == TRUE, "CAD", "Non-CAD"),
+         Distance = (distance - min(distance))/(max(distance) - min(distance))) %>%
+  select(Distance, Sex, CAD) %>%
+  drop_na(CAD) %>%
+  ggplot(aes(x = factor(Sex), y = Distance, colour = CAD)) +
+  geom_boxplot() +
+  labs(x = "", y = "Scaled Mahalanobis Distance") +
+  theme_bw()+
+  scale_colour_manual(values = c("CAD" = "firebrick1", "Non-CAD" = "dodgerblue1")) +
+  theme(text = element_text(size = 16))
+```
+
+
+
+## Manuscript
+
+```{r, fig.width = 10, fig.height = 6}
+gendered_df <- clinical_data %>%
+  mutate(closest = record_id %in% closest_humans,
+         gender = plyr::mapvalues(gender, from = c(1,2), to = c("Male", "Female"))) 
+
+ungendered_df <- gendered_df %>% 
+  mutate(closest = record_id %in% closest_humans,
+         gender = "Overall")
+
+rbind(gendered_df, ungendered_df) %>%
+  mutate(gender=factor(gender, levels = c("Overall", "Male", "Female"))) %>%
+  mutate(cacs_log = log2(cacs + 1)) %>%
+  ggplot(aes(x = distance, y = cacs_log)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) + 
+  scale_colour_manual(limits = c(FALSE, TRUE), 
+                      labels = c("Non-Chimp Signature", "Chimp Signature"), 
+                      values = c("FALSE" = "firebrick3", "TRUE" = "dodgerblue3")) +
+  labs(x = "Distance", y = "CACS (log scale)") +
+  theme_bw() +
+  facet_wrap(~gender, scales = "free")
+```
+
+
+
+```{r, fig.width = 7, fig.height = 5}
+clinical_data %>%
+  ggplot(aes(x = distance, y = cacs_log, colour = factor(gender))) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) + 
+  labs(x = "Mahalanobis distance to baseline chimpanzee profile", y = "CACS (log scale)", colour = "Sex") +
+  scale_colour_manual(limits = c("1", "2"), 
+                    labels = c("Male", "Female"), 
+                    values = c("1" = "#6fa8dc", "2" = "#e6a6c7")) +
+  theme_bw()
+```
+
+# Genetics analysis {.tabset}
+
+## Filtering 1 and 2
+
+```{r, eval = FALSE}
+## processing
+iHS_stats_filtered <- readRDS("data/chimp/genetics_results/iHS_stats_filtered.rds")
+coloc_results <- read.csv("data/chimp/genetics_results/coloc_results_df.csv")
+coloc_summary <- read.csv("data/chimp/genetics_results/coloc_summary_df.csv")
+CAD_summary <- readRDS("data/chimp/genetics_results/GCST90132314_buildGRCh37_small_lifted_filtered_20240513.rds")
+
+all_results <- coloc_results %>% 
+  left_join(coloc_summary, by = c("analyte", "ID")) %>% 
+  left_join(iHS_stats_filtered, by = join_by(snp == snpID))%>% 
+  left_join(CAD_summary, by = join_by(snp == ID))
+write.csv(all_results, "data/chimp/genetics_results/genetics_results_full.csv", row.names = FALSE, quote = FALSE)
+```
+
+```{r}
+genetics_results_all <- read.csv("data/chimp/genetics_results/genetics_results_full.csv")
+
+genetics_results_all %>% pull(ID) %>% unique %>% length
+genetics_results_all %>% pull(analyte) %>% unique %>% length
+genetics_results_all %>% group_by(ID, analyte) %>% summarise(n = n()) %>% nrow
+
+genetics_results_colocalised <- genetics_results_all %>% filter(PP.H4.abf > 0.5)
+genetics_results_colocalised %>% pull(ID) %>% unique %>% length
+genetics_results_colocalised %>% pull(analyte) %>% unique %>% length
+genetics_results_colocalised %>% group_by(ID, analyte) %>% summarise(n = n()) %>% nrow
+
+genetics_results_selection <- genetics_results_colocalised %>% 
+  filter(pvalue < 0.05) %>%
+  group_by(ID, analyte) %>%
+  slice_max(SNP.PP.H4) %>%
+  ungroup()
+genetics_results_selection %>% pull(snp) %>% unique %>% length
+genetics_results_selection %>% pull(analyte) %>% unique %>% length
+genetics_results_selection %>% group_by(snp, analyte) %>% summarise(n = n()) %>% nrow
+```
+
+
+## Filtering 3 and 4
+
+```{r}
+anc_allele_df <- data.frame(ID = c("rs56156922", "rs247616", "rs73015024", "rs56125973", "rs6511720", "rs2244608", "rs217386"), 
+                            anc_allele = c("T", "C", "G", "C", "G", "A", "A"))
+DEresults <- DEresults %>% rownames_to_column("analyte")
+lipid_qtl_results <- readRDS("data/chimp/genetics_results/lipid_qtl_combined_candidates.rds")
+```
+
+```{r}
+genetics_results_combined <- genetics_results_selection %>% 
+  left_join(lipid_qtl_results, by = c("snp" = "ID", "analyte" = "analyte"))%>% 
+  left_join(DEresults, by = "analyte") %>%
+  left_join(anc_allele_df, by = c("snp" = "ID")) %>% 
+  mutate(anc_allele = tolower(anc_allele)) %>% 
+  mutate(chimp_lipid_fc_dir = sign(logFC),
+         anc_qtl_dir = ifelse(anc_allele == Allele1, -sign(Effect), sign(Effect)),  # this direction is actually wrong, NO ITS RIGHT
+         anc_cad_dir = ifelse(anc_allele == effect_allele, sign(beta), -sign(beta))) 
+```
+
+```{r}
+genetics_results_matching <- genetics_results_combined %>% 
+  filter(chimp_lipid_fc_dir == anc_qtl_dir, adj.P.Val < 0.05) #note that anc_qtl_dir is wrong way, NO ITS RIGHT
+
+genetics_results_matching %>% pull(snp) %>% unique %>% length
+genetics_results_matching %>% pull(analyte) %>% unique %>% length
+genetics_results_matching %>% group_by(snp, analyte) %>% summarise(n = n()) %>% nrow
+step_4_lipids_20241002 <- genetics_results_matching %>% pull(analyte) %>% unique
+# write.csv(step_4_lipids_20241002, "step_4_lipids_20241002.csv", row.names = FALSE, quote = FALSE)
+
+genetics_results_matching_CAD <- genetics_results_matching %>% 
+  filter(anc_cad_dir == -1)
+
+genetics_results_matching_CAD %>% pull(snp) %>% unique %>% length
+genetics_results_matching_CAD %>% pull(analyte) %>% unique %>% length
+genetics_results_matching_CAD %>% group_by(snp, analyte) %>% summarise(n = n()) %>% nrow
+
+
+# View(all_results_combined_filter)
+
+```
+
+
+## MR results - ours {.tabset}
+
+
+```{r}
+MRresults <- readRDS("MR_results_ours_final_20241002.rds")
+# names(MRresults) <- step_4_lipids_20240829
+remove_ind <- which(is.na(MRresults))
+for(i in rev(remove_ind)){
+  MRresults[[i]] <- NULL
+}
+
+
+keep_lipids_ind <- lapply(MRresults, function(x) min(x$pval) < 0.05) %>% unlist %>% which
+step_4_lipids_20241002[keep_lipids_ind]
+
+```
+
+### nsnp = 1
+```{r}
+keep_lipids_ind <- lapply(MRresults, function(x) (min(x$pval) < 0.05 && min(x$nsnp) == 1)) %>% unlist %>% which
+MRresults[keep_lipids_ind]
+```
+
+### nsnp = 2
+```{r}
+keep_lipids_ind <- lapply(MRresults, function(x) (min(x$pval) < 0.05 && min(x$nsnp) == 2)) %>% unlist %>% which
+MRresults[keep_lipids_ind]
+```
+
+### nsnp = 3
+```{r}
+keep_lipids_ind <- lapply(MRresults, function(x) (min(x$pval) < 0.05 && min(x$nsnp) == 3)) %>% unlist %>% which
+MRresults[keep_lipids_ind]
+```
+
+
+
+### nsnp = 4
+```{r}
+keep_lipids_ind <- lapply(MRresults, function(x) (min(x$pval) < 0.05 && min(x$nsnp) == 4)) %>% unlist %>% which
+MRresults[keep_lipids_ind]
+```
+
+### nsnp >= 5
+```{r}
+keep_lipids_ind <- lapply(MRresults, function(x) (min(x$pval) < 0.05 && min(x$nsnp) >= 5)) %>% unlist %>% which
+MRresults[keep_lipids_ind]
+```
+
+## MR vis {.tabset}
+
+```{r, fig.width = 10}
+MR_results_final <- readRDS("MR_results_ours_final_20241002.rds")
+MR_dat_final <- readRDS("MR_results_ours_final_snps_20241002.rds")
+```
+
+### sm_d18_0_22_0
+
+```{r, fig.width = 6}
+res_plot <- MR_results_final$sm_d18_0_22_0
+dat_plot <- MR_dat_final$sm_d18_0_22_0
+p1 <- mr_scatter_plot(res_plot, dat_plot)
+p1[[1]] + theme_bw() + theme(text = element_text(size = 16), legend.position = "none")
+```
+
+
+```{r, fig.width = 6}
+res_single <- mr_singlesnp(dat_plot)
+p2 <- res_single %>% filter(SNP != "All - MR Egger") %>% mr_forest_plot()
+p2[[1]] + theme_bw()  + theme(text = element_text(size = 16), legend.position = "none")
+```
+
+### pc_16_0_18_0
+
+```{r, fig.width = 6}
+res_plot <- MR_results_final$pc_16_0_18_0
+dat_plot <- MR_dat_final$pc_16_0_18_0
+p1 <- mr_scatter_plot(res_plot, dat_plot)
+p1[[1]] + theme_bw() + theme(text = element_text(size = 16), legend.position = "none")
+```
+
+
+```{r, fig.width = 6}
+res_single <- mr_singlesnp(dat_plot)
+p2 <- res_single %>% filter(SNP != "All - MR Egger") %>% mr_forest_plot()
+p2[[1]] + theme_bw()  + theme(text = element_text(size = 16), legend.position = "none")
+```
+
+### sm_d18_1_22_0_sm_d16_1_24_0
+
+```{r, fig.width = 6}
+res_plot <- MR_results_final$sm_d18_1_22_0_sm_d16_1_24_0
+dat_plot <- MR_dat_final$sm_d18_1_22_0_sm_d16_1_24_0
+p1 <- mr_scatter_plot(res_plot, dat_plot)
+p1[[1]] + theme_bw() + theme(text = element_text(size = 16), legend.position = "none")
+```
+
+
+```{r, fig.width = 6}
+res_single <- mr_singlesnp(dat_plot)
+p2 <- res_single %>% filter(SNP != "All - MR Egger") %>% mr_forest_plot()
+p2[[1]] + theme_bw()  + theme(text = element_text(size = 16), legend.position = "none")
+```
+
+### sm_d18_1_24_0
+
+```{r, fig.width = 6}
+res_plot <- MR_results_final$sm_d18_1_24_0
+dat_plot <- MR_dat_final$sm_d18_1_24_0
+p1 <- mr_scatter_plot(res_plot, dat_plot)
+p1[[1]] + theme_bw() + theme(text = element_text(size = 16), legend.position = "none")
+```
+
+
+```{r, fig.width = 6}
+res_single <- mr_singlesnp(dat_plot)
+p2 <- res_single %>% filter(SNP != "All - MR Egger") %>% mr_forest_plot()
+p2[[1]] + theme_bw()  + theme(text = element_text(size = 16), legend.position = "none")
+```
+
+## Output results
+
+```{r}
+keep_lipids_ind1 <- lapply(MRresults, function(x) (min(x$pval) < 0.00294 && min(x$nsnp) == 2)) %>% unlist %>% which
+keep_lipids_ind2 <- lapply(MRresults, function(x) (min(x$pval[3]) < 0.00294 && min(x$nsnp) >= 3)) %>% unlist %>% which
+
+r1 <- MRresults$sm_d18_0_22_0
+r2 <- MRresults$pc_16_0_18_0[3,]
+r3 <- MRresults$sm_d18_1_22_0_sm_d16_1_24_0[3,]
+r4 <- MRresults$sm_d18_1_24_0[3,]
+
+final_df <- rbind(r1, r2, r3, r4) %>% 
+  mutate(lipid = c("sm_d18_0_22_0", "pc_16_0_18_0", "sm_d18_1_22_0_sm_d16_1_24_0", "sm_d18_1_24_0"), 
+         b = b, 
+         b = signif(b, 4),
+         se = signif(se, 4),
+         pval = signif(pval, 4)) %>% 
+  select(lipid, b, se, pval, nsnp) %>%
+  arrange(lipid)
+
+for(i in 1:length(final_df$lipid)){
+  lipid_name <- final_df$lipid[i]
+  final_df$MR_snps[i] <- MR_dat_final[[lipid_name]] %>% filter(mr_keep) %>% pull(SNP) %>% paste(., collapse = ", ")
+}
+
+final_df <- final_df %>% mutate(lipid = plyr::mapvalues(lipid,
+                                   from = lipid_mapping$clean_names,
+                                   to = lipid_mapping$final_names,
+                                   warn_missing = FALSE))
+
+# write.csv(final_df, "step5_MR_results_20241003.csv", row.names = FALSE, quote = FALSE)
+```
+
+## outputting tables
+
+```{r, eval = FALSE}
+overlapping_regions_summarised <- read.csv("data/chimp/genetics_results/overlapping_regions_summarised.csv") %>% select(-analyte) %>% unique
+genetics_results_colocalised %>%
+  # filter(pvalue < 0.05) %>%
+  group_by(analyte, ID) %>%
+  filter(SNP.PP.H4 == max(SNP.PP.H4)) %>%
+  left_join(overlapping_regions_summarised, by = "ID") %>%
+  select(chrom, start, end, analyte, PP.H0.abf, PP.H1.abf, PP.H2.abf, PP.H3.abf, PP.H4.abf, snp) %>%
+  unique %>%
+  mutate(analyte = plyr::mapvalues(analyte,
+                                   from = lipid_mapping$clean_names,
+                                   to = lipid_mapping$final_names,
+                                   warn_missing = FALSE),
+         PP.H0.abf = signif(PP.H0.abf, 4),
+         PP.H1.abf = signif(PP.H1.abf, 4),
+         PP.H2.abf = signif(PP.H2.abf, 4),
+         PP.H3.abf = signif(PP.H3.abf, 4),
+         PP.H4.abf = signif(PP.H4.abf, 4)) %>%
+  arrange(chrom, start) %>%
+  unique() %>%
+  write.csv("Manuscript/colocalisation_results.csv", row.names = FALSE, quote = FALSE)
+
+genetics_results_selection %>%
+  select(snp, chromosome.x, position.x, analyte, score, pvalue) %>%
+  mutate(analyte = plyr::mapvalues(analyte,
+                                   from = lipid_mapping$clean_names,
+                                   to = lipid_mapping$final_names,
+                                   warn_missing = FALSE),
+         score = signif(score, 4),
+         pvalue = signif(pvalue, 4)) %>%
+  arrange(chromosome.x, position.x) %>%
+  unique() %>%
+  write.csv("Manuscript/selection_results.csv", row.names = FALSE, quote = FALSE)
+
+genetics_results_matching %>%
+  mutate(analyte = plyr::mapvalues(analyte,
+                                   from = lipid_mapping$clean_names,
+                                   to = lipid_mapping$final_names,
+                                   warn_missing = FALSE),
+         lipid_beta = abs(Effect) * anc_qtl_dir,
+         lipid_beta = signif(lipid_beta, 4),
+         lipid_pval = signif(P, 4),
+         logFC = signif(logFC, 4),
+         der_allele = ifelse(effect_allele == anc_allele, other_allele, effect_allele)) %>%
+    select(snp, chromosome.x, position.x, analyte, lipid_beta, lipid_pval, logFC, anc_allele, der_allele) %>%
+  arrange(chromosome.x, position.x) %>% 
+  unique() %>%
+  write.csv("Manuscript/matching_results_v3.csv", row.names = FALSE, quote = FALSE)
+
+genetics_results_matching_CAD %>%
+  mutate(analyte = plyr::mapvalues(analyte,
+                                   from = lipid_mapping$clean_names,
+                                   to = lipid_mapping$final_names,
+                                   warn_missing = FALSE),
+         CAD_beta = abs(beta) * anc_cad_dir,
+         lipid_beta = abs(Effect) * anc_qtl_dir,
+         CAD_beta = signif(CAD_beta, 4),
+         CAD_pval = signif(p_value, 4),
+         lipid_beta = signif(lipid_beta, 4),
+         lipid_pval = signif(P, 4),
+         logFC = signif(logFC, 4),
+         der_allele = ifelse(effect_allele == anc_allele, other_allele, effect_allele)) %>%
+    select(snp, chromosome.x, position.x, analyte, CAD_beta, CAD_pval, lipid_beta, lipid_pval, logFC, anc_allele, der_allele) %>%
+  arrange(chromosome.x, position.x) %>% 
+  unique() %>%
+  write.csv("Manuscript/CAD_matching_results_v2.csv", row.names = FALSE, quote = FALSE)
+
+# genetics_results_colocalised %>% select(snp, chromosome.x, position.x) %>% arrange(chromosome.x, position.x) %>% View()
+```
+
+## Final marker evaluation
+
+```{r}
+final_markers <- genetics_results_matching_CAD$analyte %>% unique()
+glm_df <- bioheart_BIO[,final_markers] %>% 
+  log2 %>% 
+  mutate(CAD = clinical_data$cacs_bin)
+```
+
+```{r}
+model <- glm(CAD ~ ., data = glm_df, family = "binomial")
+summary(model)
+```
+
+```{r}
+glm_df <- bioheart_BIO[,final_markers] %>% 
+  log2 %>% 
+  mutate(CAD = clinical_data$cacs_bin,
+         Sex = clinical_data$gender,
+         Age = clinical_data$age)
+model <- glm(CAD ~ ., data = glm_df, family = "binomial")
+summary(model)
+```
+
+```{r}
+glm_df <- bioheart_BIO[,final_markers] %>% 
+  log2 %>% 
+  mutate(CAD = clinical_data$cacs_bin,
+         Sex = clinical_data$gender,
+         Age = clinical_data$age,
+         Diabetes = clinical_data$cvhx_dm,
+         Hypertension = clinical_data$cvhx_htn,
+         Hypercholesterolemia = clinical_data$cvhx_hcl_sr,
+         Smoking = clinical_data$curr_smok)
+model <- glm(CAD ~ ., data = glm_df, family = "binomial")
+summary(model)
+```
+
+
+```{r}
+set.seed(1)
+test_id <- sample(1:nrow(bioheart_BIO), floor(0.3*nrow(bioheart_BIO)))
+
+## model lipids + full clinical
+glm_df <- bioheart_BIO[,final_markers] %>% 
+  log2 %>% 
+  mutate(CAD = clinical_data$cacs_bin,
+         Sex = clinical_data$gender,
+         Age = clinical_data$age,
+         BMI = clinical_data$bmi,
+         Diabetes = clinical_data$cvhx_dm,
+         Hypertension = clinical_data$cvhx_htn,
+         Hypercholesterolemia = clinical_data$cvhx_hcl_sr,
+         Smoking = clinical_data$curr_smok)
+
+model <- glm(CAD ~ ., data = glm_df[-test_id,], family = "binomial")
+summary(model)
+
+predictions <- predict(model, glm_df[test_id,])
+roc_object <- roc( glm_df$CAD[test_id], predictions)
+plot(roc_object, print.auc = TRUE)
+
+# model lipids + min clinical
+glm_df <- bioheart_BIO[,final_markers] %>% 
+  log2 %>% 
+  mutate(CAD = clinical_data$cacs_bin,
+         Sex = clinical_data$gender,
+         Age = clinical_data$age)
+
+model <- glm(CAD ~ ., data = glm_df[-test_id,], family = "binomial")
+summary(model)
+
+predictions <- predict(model, glm_df[test_id,])
+roc_object <- roc( glm_df$CAD[test_id], predictions)
+plot(roc_object, print.auc = TRUE)
+
+# model lipids only
+glm_df <- bioheart_BIO[,final_markers] %>% 
+  log2 %>% 
+  mutate(CAD = clinical_data$cacs_bin)
+
+model <- glm(CAD ~ ., data = glm_df[-test_id,], family = "binomial")
+summary(model)
+
+predictions <- predict(model, glm_df[test_id,])
+roc_object <- roc( glm_df$CAD[test_id], predictions)
+plot(roc_object, print.auc = TRUE)
+
+## full clinical
+glm_df <- data.frame(CAD = clinical_data$cacs_bin,
+         Sex = clinical_data$gender,
+         Age = clinical_data$age,
+         BMI = clinical_data$bmi,
+         Diabetes = clinical_data$cvhx_dm,
+         Hypertension = clinical_data$cvhx_htn,
+         Hypercholesterolemia = clinical_data$cvhx_hcl_sr,
+         Smoking = clinical_data$curr_smok)
+
+model <- glm(CAD ~ ., data = glm_df[-test_id,], family = "binomial")
+summary(model)
+
+predictions <- predict(model, glm_df[test_id,])
+roc_object <- roc( glm_df$CAD[test_id], predictions)
+plot(roc_object, print.auc = TRUE)
+
+## min clinical
+glm_df <- data.frame(CAD = clinical_data$cacs_bin,
+         Sex = clinical_data$gender,
+         Age = clinical_data$age)
+
+model <- glm(CAD ~ ., data = glm_df[-test_id,], family = "binomial")
+summary(model)
+
+predictions <- predict(model, glm_df[test_id,])
+roc_object <- roc( glm_df$CAD[test_id], predictions)
+plot(roc_object, print.auc = TRUE)
+
+```
+
+# LDL plot
+
+```{r}
+chimp_lipids <- readxl::read_excel("data/chimp/Primate CAD - Serum markers-20230418[64].xlsx")
+human_lipids <- readxl::read_excel("data/bioheart/bioheart_cholesterol_levels.xlsx")
+
+chimp_ldl <- chimp_lipids %>%
+  rename("SampleID" = "...1") %>%
+  filter(str_detect(SampleID, "TZ")) %>%
+  mutate(LDL = tc - hdl - tgl/5,
+         LDL = LDL) %>%
+  pull(LDL)
+
+human_ldl <- human_lipids %>% filter(record_id %in% clinical_data$record_id) %>% pull(ldl)
+
+plot_df <- data.frame(ldl = c(chimp_ldl, human_ldl),
+                      cohort = c(rep("Chimp", 20), rep("BioHEART-CT", length(human_ldl))))
+plot_df %>% ggplot(aes(x = cohort, y = ldl)) + geom_boxplot()
+```
+
+```{r}
+chimp_lipids <- readxl::read_excel("data/chimp/Primate CAD - Serum markers-20230418[64].xlsx")
+human_lipids <- readxl::read_excel("data/bioheart/bioheart_cholesterol_levels.xlsx")
+
+chimp_ldl <- chimp_lipids %>%
+  rename("SampleID" = "...1") %>%
+  filter(str_detect(SampleID, "TZ")) %>%
+  mutate(LDL = tc - hdl - tgl/5,
+         Cohort = "Taronga") %>%
+  select(LDL, Cohort)
+
+
+human_lipids_combined <- clinical_data %>% left_join(human_lipids, by = "record_id") %>% mutate(LDL = ldl)
+
+CAD_ldl <- human_lipids_combined %>% filter(cacs_bin == TRUE) %>% mutate(Cohort = "CAD") %>% select(LDL, Cohort)
+nonCAD_ldl <- human_lipids_combined %>% filter(cacs_bin == FALSE) %>% mutate(Cohort = "non-CAD") %>% select(LDL, Cohort)
+
+historical_chimp_ldl <- data.frame(LDL = c(2.79, 2.65, 2.12, 3.01, 5.08, 5.82, 4.4, 4.16, 4.06, 4.11, 4.76, 4.86), Cohort = "Historic Chimp")
+
+all_ldl <- rbind(CAD_ldl, nonCAD_ldl, chimp_ldl, historical_chimp_ldl)
+all_ldl$Cohort <- factor(all_ldl$Cohort, levels = unique(all_ldl$Cohort))
+
+
+all_ldl %>% 
+  ggplot(aes(x = Cohort, y = LDL)) +
+    geom_boxplot() + 
+    theme_bw() +
+    labs(y = "LDL (mmol/L)")+
+    theme(text = element_text(size = 16))
+  
+all_ldl %>% 
+  group_by(Cohort) %>%
+  summarise(mean = mean(LDL, na.rm = TRUE))
+```
+
+
+
+# Chimp Signature analysis - top lipids {.tabset}
+
+## top 10
+```{r}
+top_10_lipids <- DEresults$analyte[1:10]
+# top_10_lipids <- DEresults %>% arrange(-abs(logFC)) %>% pull(analyte) %>% head(10)
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+visualise_closest_humans(closest_humans)
+table1_closest_humans(closest_humans)
+```
+
+## top 20
+```{r}
+top_10_lipids <- DEresults$analyte[1:20]
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+visualise_closest_humans(closest_humans)
+table1_closest_humans(closest_humans)
+```
+
+
+
+## top 50
+```{r}
+top_10_lipids <- DEresults$analyte[1:50]
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+visualise_closest_humans(closest_humans)
+table1_closest_humans(closest_humans)
+```
+
+
+
+## top 100
+```{r}
+top_10_lipids <- DEresults$analyte[1:100]
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+visualise_closest_humans(closest_humans)
+table1_closest_humans(closest_humans)
+```
+
+
+## top 200
+```{r}
+top_10_lipids <- DEresults$analyte[1:200]
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+visualise_closest_humans(closest_humans)
+table1_closest_humans(closest_humans)
+```
+
+
+
+## top 300
+```{r}
+top_10_lipids <- DEresults$analyte[1:300]
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+visualise_closest_humans(closest_humans)
+table1_closest_humans(closest_humans)
+```
+
+## top 10 (FC)
+```{r}
+top_10_lipids <- DEresults %>% arrange(-abs(logFC)) %>% pull(analyte) %>% head(10)
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+visualise_closest_humans(closest_humans)
+table1_closest_humans(closest_humans)
+```
+
+## top 20 (FC)
+```{r}
+top_10_lipids <- DEresults %>% arrange(-abs(logFC)) %>% pull(analyte) %>% head(20)
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+visualise_closest_humans(closest_humans)
+table1_closest_humans(closest_humans)
+```
+
+
+
+## top 50 (FC)
+```{r}
+top_10_lipids <- DEresults %>% arrange(-abs(logFC)) %>% pull(analyte) %>% head(50)
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+visualise_closest_humans(closest_humans)
+table1_closest_humans(closest_humans)
+```
+
+
+
+## top 100 (FC)
+```{r}
+top_10_lipids <- DEresults %>% arrange(-abs(logFC)) %>% pull(analyte) %>% head(100)
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+visualise_closest_humans(closest_humans)
+table1_closest_humans(closest_humans)
+```
+
+
+## top 200 (FC)
+```{r}
+top_10_lipids <- DEresults %>% arrange(-abs(logFC)) %>% pull(analyte) %>% head(200)
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+visualise_closest_humans(closest_humans)
+table1_closest_humans(closest_humans)
+```
+
+
+
+## top 300 (FC)
+```{r}
+top_10_lipids <- DEresults %>% arrange(-abs(logFC)) %>% pull(analyte) %>% head(300)
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+visualise_closest_humans(closest_humans)
+table1_closest_humans(closest_humans)
+```
+
+## chimp genetics lipids
+
+```{r, eval = F}
+top_10_lipids <- names(results_df1)
+
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+visualise_closest_humans(closest_humans)
+table1_closest_humans(closest_humans)
+```
+
+
+# Chimp Signature analysis - top lipids (bottom vs top quintile) {.tabset}
+
+```{r}
+table1_closest_furthest_humans <- function(closest_humans, furthest_humans){
+  clinical_data %>%
+  mutate(closest = case_when(record_id %in% closest_humans ~ "Chimp Signature",
+                             record_id %in% furthest_humans ~ "Non-chimp Signature",
+                             TRUE ~ NA), 
+         gender = factor(gender, levels = 1:2, labels = c("Male", "Female")),
+         cvhx_dm = factor(cvhx_dm),
+         cvhx_htn = factor(cvhx_htn),
+         smoking_status = factor(smoking_status, 
+                                 levels = 1:3, 
+                                 labels = c("Current Smoker", "Never Smoked", "Ex-Smoker")),
+         statin = factor(statin),
+         cacs = as.numeric(cacs),
+         cacs_bin = cacs > 0,
+         cacs_log = log2(cacs+1),
+         cacs_pct = as.numeric(cacs_pct),
+         gensini = as.numeric(gensini),
+         gensini_bin = gensini>0,
+         gensini_log = log2(gensini+1),
+         sps = as.numeric(sps_d),
+         sps_log = log2(sps+1),
+         sps_bin = sps > 0) %>%
+    rename(`CACS (log scale)` = cacs_log,
+           `CACS positive` = cacs_bin,
+           `CACS percentile` = cacs_pct,
+           `Gensini (log scale)` = gensini_log,
+           `Gensini positive` = gensini_bin,
+           `Soft plaque score (log scale)` = sps_log,
+           `Soft plaque positive` = sps_bin,
+           `Soft plaque ratio` = sps_ratio) %>%
+  select(closest, `CACS (log scale)`, `CACS positive`, `CACS percentile`, `Gensini (log scale)`, `Gensini positive`, `Soft plaque score (log scale)`, `Soft plaque positive`, `Soft plaque ratio`) %>%
+  drop_na() %>%
+  table1(~ . | closest, data = ., overall=F, extra.col=list(`P-value`=pvalue))
+}
+```
+
+
+## All
+```{r}
+combined_bc <- log2(rbind(bioheart_BIO, chimp_BIO))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+furthest_humans <- names(mahalanobis_dist[mahalanobis_dist > quantile(mahalanobis_dist, 0.8)])
+visualise_closest_humans(closest_humans)
+table1_closest_furthest_humans(closest_humans, furthest_humans)
+```
+
+## top 10
+```{r}
+top_10_lipids <- DEresults$analyte[1:10]
+# top_10_lipids <- DEresults %>% arrange(-abs(logFC)) %>% pull(analyte) %>% head(10)
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+furthest_humans <- names(mahalanobis_dist[mahalanobis_dist > quantile(mahalanobis_dist, 0.8)])
+visualise_closest_humans(closest_humans)
+table1_closest_furthest_humans(closest_humans, furthest_humans)
+```
+
+## top 20
+```{r}
+top_10_lipids <- DEresults$analyte[1:20]
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+furthest_humans <- names(mahalanobis_dist[mahalanobis_dist > quantile(mahalanobis_dist, 0.8)])
+visualise_closest_humans(closest_humans)
+table1_closest_furthest_humans(closest_humans, furthest_humans)
+```
+
+
+
+## top 50
+```{r}
+top_10_lipids <- DEresults$analyte[1:50]
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+furthest_humans <- names(mahalanobis_dist[mahalanobis_dist > quantile(mahalanobis_dist, 0.8)])
+visualise_closest_humans(closest_humans)
+table1_closest_furthest_humans(closest_humans, furthest_humans)
+```
+
+
+
+## top 100
+```{r}
+top_10_lipids <- DEresults$analyte[1:100]
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+furthest_humans <- names(mahalanobis_dist[mahalanobis_dist > quantile(mahalanobis_dist, 0.8)])
+visualise_closest_humans(closest_humans)
+table1_closest_furthest_humans(closest_humans, furthest_humans)
+```
+
+
+## top 200
+```{r}
+top_10_lipids <- DEresults$analyte[1:200]
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+furthest_humans <- names(mahalanobis_dist[mahalanobis_dist > quantile(mahalanobis_dist, 0.8)])
+visualise_closest_humans(closest_humans)
+table1_closest_furthest_humans(closest_humans, furthest_humans)
+```
+
+
+
+## top 300
+```{r}
+top_10_lipids <- DEresults$analyte[1:300]
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+furthest_humans <- names(mahalanobis_dist[mahalanobis_dist > quantile(mahalanobis_dist, 0.8)])
+visualise_closest_humans(closest_humans)
+table1_closest_furthest_humans(closest_humans, furthest_humans)
+```
+
+## top 10 (FC)
+```{r}
+top_10_lipids <- DEresults %>% arrange(-abs(logFC)) %>% pull(analyte) %>% head(10)
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+furthest_humans <- names(mahalanobis_dist[mahalanobis_dist > quantile(mahalanobis_dist, 0.8)])
+visualise_closest_humans(closest_humans)
+table1_closest_furthest_humans(closest_humans, furthest_humans)
+```
+
+## top 20 (FC)
+```{r}
+top_10_lipids <- DEresults %>% arrange(-abs(logFC)) %>% pull(analyte) %>% head(20)
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+furthest_humans <- names(mahalanobis_dist[mahalanobis_dist > quantile(mahalanobis_dist, 0.8)])
+visualise_closest_humans(closest_humans)
+table1_closest_furthest_humans(closest_humans, furthest_humans)
+```
+
+
+
+## top 50 (FC)
+```{r}
+top_10_lipids <- DEresults %>% arrange(-abs(logFC)) %>% pull(analyte) %>% head(50)
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+furthest_humans <- names(mahalanobis_dist[mahalanobis_dist > quantile(mahalanobis_dist, 0.8)])
+visualise_closest_humans(closest_humans)
+table1_closest_furthest_humans(closest_humans, furthest_humans)
+```
+
+
+
+## top 100 (FC)
+```{r}
+top_10_lipids <- DEresults %>% arrange(-abs(logFC)) %>% pull(analyte) %>% head(100)
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+furthest_humans <- names(mahalanobis_dist[mahalanobis_dist > quantile(mahalanobis_dist, 0.8)])
+visualise_closest_humans(closest_humans)
+table1_closest_furthest_humans(closest_humans, furthest_humans)
+```
+
+
+## top 200 (FC)
+```{r}
+top_10_lipids <- DEresults %>% arrange(-abs(logFC)) %>% pull(analyte) %>% head(200)
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+furthest_humans <- names(mahalanobis_dist[mahalanobis_dist > quantile(mahalanobis_dist, 0.8)])
+visualise_closest_humans(closest_humans)
+table1_closest_furthest_humans(closest_humans, furthest_humans)
+```
+
+
+
+## top 300 (FC)
+```{r}
+top_10_lipids <- DEresults %>% arrange(-abs(logFC)) %>% pull(analyte) %>% head(300)
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+furthest_humans <- names(mahalanobis_dist[mahalanobis_dist > quantile(mahalanobis_dist, 0.8)])
+visualise_closest_humans(closest_humans)
+table1_closest_furthest_humans(closest_humans, furthest_humans)
+```
+
+## chimp genetics lipids
+
+```{r, eval = F}
+top_10_lipids <- names(results_df1)
+
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+furthest_humans <- names(mahalanobis_dist[mahalanobis_dist > quantile(mahalanobis_dist, 0.8)])
+visualise_closest_humans(closest_humans)
+table1_closest_furthest_humans(closest_humans, furthest_humans)
+```
+
+
+
+
+# Chimp Signature analysis - top lipids (ratios) {.tabset}
+
+## top 10
+```{r}
+top_10_lipids <- DEresults$analyte[1:10]
+# top_10_lipids <- DEresults %>% arrange(-abs(logFC)) %>% pull(analyte) %>% head(10)
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+combined_bc_pair <- CPOP::pairwise_col_diff(combined_bc)
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc_pair)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+visualise_closest_humans(closest_humans)
+table1_closest_humans(closest_humans)
+```
+
+## top 20
+```{r}
+top_10_lipids <- DEresults$analyte[1:20]
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+combined_bc_pair <- CPOP::pairwise_col_diff(combined_bc)
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc_pair)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+visualise_closest_humans(closest_humans)
+table1_closest_humans(closest_humans)
+```
+
+## top 50
+```{r}
+top_10_lipids <- DEresults$analyte[1:50]
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+combined_bc_pair <- CPOP::pairwise_col_diff(combined_bc)
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc_pair)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+visualise_closest_humans(closest_humans)
+table1_closest_humans(closest_humans)
+```
+
+## top 10 (FC)
+```{r}
+top_10_lipids <- DEresults %>% arrange(-abs(logFC)) %>% pull(analyte) %>% head(10)
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+combined_bc_pair <- CPOP::pairwise_col_diff(combined_bc)
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc_pair)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+visualise_closest_humans(closest_humans)
+table1_closest_humans(closest_humans)
+```
+
+## top 20 (FC)
+```{r}
+top_10_lipids <- DEresults %>% arrange(-abs(logFC)) %>% pull(analyte) %>% head(20)
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+combined_bc_pair <- CPOP::pairwise_col_diff(combined_bc)
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc_pair)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+visualise_closest_humans(closest_humans)
+table1_closest_humans(closest_humans)
+```
+
+
+
+## top 50 (FC)
+```{r}
+top_10_lipids <- DEresults %>% arrange(-abs(logFC)) %>% pull(analyte) %>% head(50)
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+combined_bc_pair <- CPOP::pairwise_col_diff(combined_bc)
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc_pair)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+visualise_closest_humans(closest_humans)
+table1_closest_humans(closest_humans)
+```
+
+
+## chimp genetics lipids
+
+```{r, eval = FALSE}
+top_10_lipids <- names(results_df1)
+
+
+combined_bc <- log2(rbind(bioheart_BIO[,top_10_lipids], chimp_BIO[,top_10_lipids]))
+combined_bc_pair <- CPOP::pairwise_col_diff(combined_bc)
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc_pair)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+record_id <- rownames(bioheart_BIO)
+record_id <- c(record_id, rep(NA, nrow(chimp_BIO)))
+df_pca$record_id <- as.numeric(record_id)
+df_pca <- left_join(df_pca, clinical_data, by = "record_id")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = batch)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_colour_manual(values = c("bioheart" = "firebrick3", "chimp" = "dodgerblue3"))
+
+pca_human = prcomp(log2(bioheart_BIO[,top_10_lipids]), scale = TRUE)
+mat_pca <- pca_human$x
+chimp_means <- chimp_BIO[,top_10_lipids] %>% colMeans %>% log2
+chimp_means_PCA <- ((chimp_means - pca_human$center)/pca_human$scale) %*% pca_human$rotation
+
+mahalanobis_dist = distmat(mat_pca, chimp_means_PCA)[,1]
+clinical_data$distance <- mahalanobis_dist
+
+closest_humans <- names(mahalanobis_dist[mahalanobis_dist < quantile(mahalanobis_dist, 0.2)])
+visualise_closest_humans(closest_humans)
+table1_closest_humans(closest_humans)
+```
+

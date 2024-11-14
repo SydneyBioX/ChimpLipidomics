@@ -1,0 +1,1061 @@
+---
+title: "BioHEART and Chimp merging"
+author: "Andy Tran"
+date: "University of Sydney | `r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    fig_caption: yes
+    number_sections: yes
+    self_contained: yes
+    theme: flatly
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Data processing {.tabset}
+
+## Load packages
+```{r}
+suppressPackageStartupMessages({
+  library(plotly)
+  library(tidyverse)
+  # library(scMerge)
+  library(ruv)
+  library(impute)
+  library(pheatmap)
+  library(table1)
+  library(ggpubr)
+  })
+```
+
+## Load data and clean names
+
+```{r}
+load("data/bioheart/5_BH_Cleaned.RData")
+bioheart_areas <- BH_MI$MetricData$Area %>% data.frame() %>% janitor::clean_names() %>% t %>% impute.knn()
+bioheart_areas <- bioheart_areas$data %>% t %>% data.frame
+
+bioheart_IS <- BH_MI$MetaboliteData 
+bioheart_IS$IS_ind <- sapply(bioheart_IS$Final_ISTD_Name, function(x) which(bioheart_IS$Final_Metabolite_Name == x))  
+dim(bioheart_areas)
+
+chimp_areas <- readxl::read_excel("data/chimp/2023_03_29 - MP22_063_raw areas_mapped[1].xlsx") %>% data.frame()
+chimp_IS <- readxl::read_excel("data/chimp/1_description/2023_tables for 6495 methods section.xlsx", skip = 1)
+dim(chimp_IS)
+
+rownames(chimp_areas) <- chimp_areas$Sample.ID
+chimp_areas <- chimp_areas[,-(1:2)]
+chimp_areas <- chimp_areas %>% janitor::clean_names()
+dim(chimp_areas)
+```
+
+```{r}
+lipid_name_mapping <- readxl::read_excel("data/2024_04_15 - Aligned BioHeart Nomenclature.xlsx")
+lipid_name_mapping$BioHeart %>% na.omit() %>% length
+lipid_name_mapping$Chimp %>% na.omit() %>% length
+lipid_name_mapping$Common %>% na.omit() %>% length
+```
+
+```{r}
+lipid_name_mapping <- lipid_name_mapping %>% 
+  mutate(BioHeart_clean = janitor::make_clean_names(BioHeart),
+         Chimp_clean = janitor::make_clean_names(Chimp),
+         Common_clean = janitor::make_clean_names(Common)) 
+
+setdiff(colnames(bioheart_areas), lipid_name_mapping$BioHeart_clean)
+setdiff(lipid_name_mapping$BioHeart_clean, colnames(bioheart_areas))
+
+setdiff(colnames(chimp_areas), lipid_name_mapping$Chimp_clean)
+setdiff(lipid_name_mapping$Chimp_clean, colnames(chimp_areas))
+
+comparison <- lipid_name_mapping %>% select(BioHeart, Chimp) %>% na.omit() 
+sum(comparison$BioHeart == comparison$Chimp)
+```
+
+```{r}
+colnames(bioheart_areas)[which(colnames(bioheart_areas) == "sulfatide_d18_1_16_0_oh")] <- "s_hex_cer_d18_1_16_0_oh"
+colnames(bioheart_areas)[which(colnames(bioheart_areas) == "sulfatide_d18_1_16_0")] <- "s_hex_cer_d18_1_16_0"
+colnames(bioheart_areas)[which(colnames(bioheart_areas) == "sulfatide_d18_1_24_0_oh")] <- "s_hex_cer_d18_1_24_0_oh"
+colnames(bioheart_areas)[which(colnames(bioheart_areas) == "sulfatide_d18_1_24_0")] <- "s_hex_cer_d18_1_24_0"
+colnames(bioheart_areas)[which(colnames(bioheart_areas) == "sulfatide_d18_1_24_1_oh")] <- "s_hex_cer_d18_1_24_1_oh"
+colnames(bioheart_areas)[which(colnames(bioheart_areas) == "sulfatide_d18_1_24_1")] <- "s_hex_cer_d18_1_24_1"
+
+
+
+bioheart_IS$Final_Metabolite_Name[which(bioheart_IS$Final_Metabolite_Name == "Sulfatide (d18:1:/16:0(OH))")] <- "SHexCer(d18:1/16:0(OH))"
+bioheart_IS$Final_Metabolite_Name[which(bioheart_IS$Final_Metabolite_Name == "Sulfatide (d18:1:/16:0)")] <- "SHexCer(d18:1/16:0"
+bioheart_IS$Final_Metabolite_Name[which(bioheart_IS$Final_Metabolite_Name == "Sulfatide (d18:1:/24:0(OH))")] <- "SHexCer(d18:1/24:0(OH))"
+bioheart_IS$Final_Metabolite_Name[which(bioheart_IS$Final_Metabolite_Name == "Sulfatide (d18:1:/24:0)")] <- "SHexCer(d18:1/24:0"
+bioheart_IS$Final_Metabolite_Name[which(bioheart_IS$Final_Metabolite_Name == "Sulfatide (d18:1:/24:1(OH))")] <- "SHexCer(d18:1/24:1(OH))"
+bioheart_IS$Final_Metabolite_Name[which(bioheart_IS$Final_Metabolite_Name == "Sulfatide (d18:1:/24:1)")] <- "SHexCer(d18:1/24:1)"
+
+```
+
+
+```{r}
+length(intersect(colnames(bioheart_areas), colnames(chimp_areas)))
+
+update_ind <- which(colnames(bioheart_areas) %in% lipid_name_mapping$BioHeart_clean)
+colnames(bioheart_areas)[update_ind] <- plyr::mapvalues(colnames(bioheart_areas)[update_ind],
+                                                        from = lipid_name_mapping$BioHeart_clean,
+                                                        to = lipid_name_mapping$Common_clean,
+                                                        warn_missing = FALSE)
+
+
+update_ind <- which(colnames(chimp_areas) %in% lipid_name_mapping$Chimp_clean)
+colnames(chimp_areas)[update_ind] <- plyr::mapvalues(colnames(chimp_areas)[update_ind],
+                                                        from = lipid_name_mapping$Chimp_clean,
+                                                        to = lipid_name_mapping$Common_clean,
+                                                        warn_missing = FALSE)
+
+length(intersect(colnames(bioheart_areas), colnames(chimp_areas)))
+```
+
+
+## Bioheart tube labels and clinical data
+
+```{r}
+labels <- read.csv("data/bioheart/tube_label.csv")
+clinical_data_full <- readxl::read_excel("data/bioheart/BioCT-DL_20220209.xlsx")
+
+tubes_present <- unname(sapply(rownames(bioheart_areas), function(x) strsplit(x, "_")[[1]][5]))
+tubes_present <- sub(" ", "", tubes_present)
+labels$tube_id_clean <- sub(" ", "", labels$tube_id)
+
+present_samples <- plyr::mapvalues(tubes_present, 
+                                   from = labels$tube_id_clean, 
+                                   to = labels$sample.ID, 
+                                   warn_missing = FALSE)
+  
+clinical_data <- data.frame(record_id = as.numeric(present_samples[BH_MI$SampleData$SampleTypeLabel == "BIO"]))
+clinical_data <- mutate(clinical_data, tube_id_clean = plyr::mapvalues(record_id, 
+                                                                       from = labels$sample.ID, 
+                                                                       to = labels$tube_id_clean, 
+                                                                       warn_missing = FALSE))
+clinical_data <- left_join(clinical_data, clinical_data_full, by = "record_id")
+```
+
+
+
+# Calculate Concentrations using IS {.tabset}
+
+## Checking IS names
+
+```{r}
+IS_present_chimp <- data.frame(ind = which(str_detect(colnames(chimp_areas), "is$"))) %>%
+  mutate(name = colnames(chimp_areas)[ind],
+         class = sub("\\_.*", "", name)) 
+
+chimp_IS <- chimp_IS %>% mutate(name_clean = janitor::make_clean_names(chimp_IS$`Internal Standard`),
+                                name_clean = paste0(name_clean, "_is"))
+chimp_IS <- chimp_IS %>% 
+  mutate(name_clean = plyr::mapvalues(chimp_IS$name_clean,
+                                      from = c("ac_16_0_d3_is", 
+                                               "dh_cer_d18_0_8_0_is", 
+                                               "ffa_18_1_d9_is", 
+                                               "s1p_18_1_d7_is",
+                                               "hex_cer_d18_1_d7_15_0_is",
+                                               "tg_15_0_18_1_d7_15_0_2_is",
+                                               "hex2cer_d18_1_d7_15_0_is",
+                                               "sm_d18_1_d9_15_0_is"),
+                                      to = c("acyl_carnitine_16_0_d3_is", 
+                                             "dh_cer_8_0_is", 
+                                             "fa_18_1_d9_is", 
+                                             "s1p_d18_1_d7_is",
+                                             "hex_cer_d18_1_15_0_d7_is",
+                                             "tg_48_1_nl_18_1_d7_is",
+                                             "hex2cer_d18_1_15_0_d7_is",
+                                             "sm_d18_1_15_0_d9_is"))) %>%
+  mutate(class = sub("\\_.*", "", name_clean))
+```
+
+## Create lipid to IS mapping
+
+```{r}
+ISTD_matchup <- readxl::read_excel("data/ISTD_matchup.xlsx") %>% 
+  data.frame() %>%
+  mutate(analyte_clean = janitor::make_clean_names(analyte),
+         ISTD_clean = sapply(ISTD, function(x) janitor::make_clean_names(x)))
+
+#setdiff(colnames(chimp_areas), ISTD_matchup$analyte_clean)
+
+IS_mapping <- data.frame(analyte = colnames(chimp_areas)) %>%
+  mutate(IS = plyr::mapvalues(analyte, from = ISTD_matchup$analyte_clean, to = ISTD_matchup$ISTD_clean, warn_missing = F),
+         IS_ind = plyr::mapvalues(IS, from = IS_present_chimp$name, to = IS_present_chimp$ind, warn_missing = F),
+         IS_ind = as.numeric(IS_ind),
+         IS_conc = plyr::mapvalues(IS, from = chimp_IS$name_clean, to = chimp_IS$`Internal Standard (pmol)/sample`, warn_missing = F),
+         IS_conc = as.numeric(sub(",", "", IS_conc)),
+         class = sub("\\_.*", "", IS))
+  
+lipid_classes <- unique(IS_mapping$class)
+
+## remove lipids that don't match to an IS or aren't found in the Baker IS list
+missing_inds <- is.na(IS_mapping$IS_ind) | is.na(IS_mapping$IS_conc)
+chimp_areas <- chimp_areas[,!missing_inds]
+IS_mapping <- IS_mapping[!missing_inds,]
+
+dim(chimp_areas)
+dim(IS_mapping)
+```
+
+```{r}
+IS_present_bioheart <- data.frame(ind = which(str_detect(colnames(bioheart_areas), "is$"))) %>%
+  mutate(name = colnames(bioheart_areas)[ind],
+         class = sub("\\_.*", "", name)) 
+
+intersect(IS_present_chimp$name, IS_present_bioheart$name)
+setdiff(IS_present_chimp$name, IS_present_bioheart$name)
+setdiff(IS_present_bioheart$name, IS_present_chimp$name)
+
+bioheart_IS <- bioheart_IS %>% 
+  mutate(analyte = janitor::make_clean_names(Final_Metabolite_Name),
+         ISTD_clean = sapply(Final_ISTD_Name, function(x) janitor::make_clean_names(x)),
+         class = sub("\\_.*", "", ISTD_clean))
+```
+
+
+## Calculate concentrations
+
+```{r}
+chimp_matrix <- as.matrix(chimp_areas)
+chimp_conc <- matrix(nrow = nrow(chimp_matrix), ncol = ncol(chimp_matrix))
+for(i in 1:nrow(chimp_matrix)){
+  chimp_conc[i,] <- (chimp_matrix[i,]/chimp_matrix[i,IS_mapping$IS_ind]) * IS_mapping$IS_conc *100
+}
+dimnames(chimp_conc) <- dimnames(chimp_areas)
+chimp_conc <- data.frame(chimp_conc)
+dim(chimp_conc)
+```
+
+```{r}
+bioheart_matrix <- as.matrix(bioheart_areas)
+bioheart_conc <- matrix(nrow = nrow(bioheart_matrix), ncol = ncol(bioheart_matrix))
+for(i in 1:nrow(bioheart_matrix)){
+  bioheart_conc[i,] <- (bioheart_matrix[i,]/bioheart_matrix[i,bioheart_IS$IS_ind]) * bioheart_IS$Ref_Concentration * bioheart_IS$Response_Factor *100
+}
+dimnames(bioheart_conc) <- dimnames(bioheart_areas)
+bioheart_conc <- data.frame(bioheart_conc)
+dim(bioheart_conc)
+```
+
+
+```{r}
+bioheart_conc_long <- pivot_longer(bioheart_conc, cols = everything(), names_to = "analyte", values_to = "New_Value")
+
+old_conc_long <- BH_MI$MetricData$Conc %>% 
+  data.frame() %>% 
+  janitor::clean_names() %>%
+  pivot_longer(cols = everything(), names_to = "analyte", values_to = "Old_Value")
+
+identical(bioheart_conc_long$analyte, old_conc_long$analyte)
+
+plot_df <- bioheart_conc_long
+plot_df$Old_Value <- old_conc_long$Old_Value
+plot_df <- plot_df %>% 
+  group_by(analyte) %>%
+  summarise(New_Value = mean(New_Value), Old_Value = mean(Old_Value)) %>%
+  mutate(class = plyr::mapvalues(analyte, from = bioheart_IS$analyte, to = bioheart_IS$Metabolite_Class, warn_missing = F))
+
+p <- plot_df %>% 
+  ggplot(aes(x = log(Old_Value),
+             y = log(New_Value), 
+             color = class,
+             text = paste("Analyte:", analyte))) + 
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  labs(title="Observed analyte means between original and calculated concentration calculations",
+       x ="Original Log Values", 
+       y = "Calculated Log values")
+ggplotly(p)
+```
+
+
+# Set up {.tabset}
+
+## Subset to common lipids
+
+```{r}
+## filter to common lipids
+common_lipids_withIS <- sort(Reduce(intersect, list(colnames(chimp_conc),colnames(bioheart_areas))))
+length(common_lipids_withIS)
+
+chimp_areas_common_withIS <- chimp_areas[,common_lipids_withIS]
+bioheart_areas_common_withIS <- bioheart_areas[,common_lipids_withIS]
+
+
+common_lipids <- common_lipids_withIS[!str_detect(common_lipids_withIS, "is$")]  ## remove IS lipids
+length(common_lipids)
+
+chimp_conc_common <- chimp_conc[,common_lipids]
+bioheart_conc_common <- bioheart_conc[,common_lipids]
+chimp_areas_common <- chimp_areas[,common_lipids]
+bioheart_areas_common <- bioheart_areas[,common_lipids] 
+```
+
+```{r}
+setdiff(lipid_name_mapping$Common_clean, common_lipids)
+```
+
+
+Create mapping 
+
+```{r}
+class_mapping <- bioheart_IS %>% select(analyte, Metabolite_Class) %>% filter(analyte %in% common_lipids) %>% arrange(analyte)
+
+class_mapping <- class_mapping[order(class_mapping$analyte),]
+
+identical(colnames(bioheart_areas_common), colnames(chimp_areas_common))
+identical(colnames(bioheart_conc_common), colnames(chimp_conc_common))
+identical(class_mapping$analyte, colnames(bioheart_conc_common))
+```
+
+
+## Define functions
+
+Check distribution function
+
+```{r}
+check_distribution <- function(bioheart_data, chimp_data){
+  bioheart_long <- bioheart_data %>% 
+  mutate(sampleID = rownames(bioheart_data)) %>%
+  pivot_longer(cols = -"sampleID", names_to = "species", values_to  = "Value") %>%
+  mutate(cohort = "bioheart")
+
+chimp_long <- chimp_data %>% 
+  mutate(sampleID = rownames(chimp_data)) %>%
+  pivot_longer(cols = -"sampleID", names_to = "species", values_to  = "Value") %>%
+  mutate(cohort = "chimp")
+
+combined_long <- rbind(bioheart_long, chimp_long) %>% 
+  mutate(cohort = factor(cohort, levels = c("bioheart", "chimp")),
+         class = plyr::mapvalues(species, from = class_mapping$analyte, to = class_mapping$Metabolite_Class, warn_missing = F))
+
+lipid_totals_order <- combined_long %>% group_by(class) %>% summarise(sums = sum(Value)) %>% arrange(-sums) %>% pull(class)
+
+combined_long %>%  
+  mutate(class = factor(class, levels = lipid_totals_order)) %>%
+  group_by(class, cohort, sampleID) %>%
+  summarise(Value = sum(Value)) %>%
+  ggplot(aes(x = class, y = log2(Value), colour = cohort)) + 
+    geom_boxplot() + 
+    theme_bw() +  
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+    ggtitle("Totals by class")
+}
+```
+
+PCA visualisation
+
+```{r}
+pca_visualisation <- function(bioheart_data, chimp_data){
+  
+combined_bc <- log2(rbind(bioheart_data, chimp_data))
+batch = c(rep("bioheart", nrow(bioheart_data)), 
+          rep("chimp", nrow(chimp_data)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = cohort)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() 
+}
+```
+
+PCA visualisation with variables
+
+```{r}
+pca_visualisation_detailed <- function(bioheart_data, chimp_data){
+  
+combined_bc <- log2(rbind(bioheart_data, chimp_data))
+batch = c(rep("bioheart", nrow(bioheart_data)), 
+          rep("chimp", nrow(chimp_data)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+tubes_present <- unname(sapply(rownames(bioheart_data), function(x) strsplit(x, "_")[[1]][5]))
+tubes_present <- sub(" ", "", tubes_present)
+tubes_present <- c(tubes_present, rep(NA, nrow(chimp_data)))
+df_pca$tube_id_clean <- tubes_present
+df_pca <- left_join(df_pca, clinical_data, by = "tube_id_clean")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+p1 <- ggplot(df_pca, aes(x = PC1, y = PC2, colour = cohort)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() 
+
+p2 <- ggplot(df_pca, aes(x = PC1, y = PC2, colour = age)) +
+  geom_point() + 
+  scale_colour_viridis_c() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() 
+
+p3 <- ggplot(df_pca, aes(x = PC1, y = PC2, colour = factor(gender))) +
+  geom_point() + 
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() 
+
+p4 <- ggplot(df_pca, aes(x = PC1, y = PC2, colour = cacs>0)) +
+  geom_point() + 
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() 
+
+p5 <- ggplot(df_pca, aes(x = PC1, y = PC2, colour = as.numeric(gensini)>0)) +
+  geom_point() + 
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() 
+
+print(p1)
+print(p2)
+print(p3)
+print(p4)
+print(p5)
+}
+
+```
+
+Plot correlations
+
+```{r}
+plot_correlations <- function(bioheart_data, chimp_data){
+  cor_conc <- cor(log2(t(bioheart_data)), log2(t(chimp_data)))
+  pheatmap(cor_conc, show_rownames = F, main = "Correlation between bioheart and chimp samples")
+}
+```
+
+Plot differences
+
+```{r}
+plot_differences <- function(bioheart_data, chimp_data){
+  plot_df <- data.frame(means_bioheart = log2(colMeans(bioheart_data)),
+                        means_chimp = log2(colMeans(chimp_data)),
+                        analyte = colnames(chimp_data))
+  plot_df <- plot_df %>% 
+    mutate(class = plyr::mapvalues(analyte, from = class_mapping$analyte, to = class_mapping$Metabolite_Class, warn_missing = F))
+  
+  p <- plot_df %>% 
+    ggplot(aes(x = means_chimp,
+               y = means_bioheart, 
+               color = class,
+               text = paste("Analyte:", analyte))) + 
+    geom_point() +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+    labs(title="Observed analyte means between bioheart and chimp cohorts",
+         x ="Chimp Means", 
+         y = "Bioheart Means")
+  ggplotly(p)
+}
+```
+
+
+Extract NIST and BIO samples
+
+```{r}
+extract_NIST_bioheart <- function(bioheart_data){bioheart_data[BH_MI$SampleData$SampleTypeLabel == "NIST1950",]}
+extract_BIO_bioheart <- function(bioheart_data){bioheart_data[BH_MI$SampleData$SampleTypeLabel == "BIO",]}
+extract_NIST_chimp <- function(chimp_data){chimp_data[str_which(rownames(chimp_data),"NIST"),]}
+extract_BIO_chimp <- function(chimp_data){chimp_data[str_which(rownames(chimp_data),"TZ"),]}
+```
+
+
+
+
+
+
+# Visualise Raw data {.tabset}
+
+## NIST areas
+```{r}
+bioheart_areas_nist <- extract_NIST_bioheart(bioheart_areas_common)
+chimp_areas_nist <- extract_NIST_chimp(chimp_areas_common)
+check_distribution(bioheart_areas_nist, chimp_areas_nist)
+pca_visualisation(bioheart_areas_nist, chimp_areas_nist)
+plot_correlations(bioheart_areas_nist, chimp_areas_nist)
+plot_differences(bioheart_areas_nist, chimp_areas_nist)
+```
+
+## BIO areas
+```{r}
+bioheart_areas_BIO <- extract_BIO_bioheart(bioheart_areas_common)
+chimp_areas_BIO <- extract_BIO_chimp(chimp_areas_common)  
+check_distribution(bioheart_areas_BIO, chimp_areas_BIO)
+pca_visualisation_detailed(bioheart_areas_BIO, chimp_areas_BIO)
+plot_correlations(bioheart_areas_BIO, chimp_areas_BIO)
+plot_differences(bioheart_areas_BIO, chimp_areas_BIO)
+```
+
+
+## NIST concentrations
+```{r}
+bioheart_conc_nist <- extract_NIST_bioheart(bioheart_conc_common)
+chimp_conc_nist <- extract_NIST_chimp(chimp_conc_common)
+check_distribution(bioheart_conc_nist, chimp_conc_nist)
+pca_visualisation(bioheart_conc_nist, chimp_conc_nist)
+plot_correlations(bioheart_conc_nist, chimp_conc_nist)
+plot_differences(bioheart_conc_nist, chimp_conc_nist)
+```
+
+## BIO concentrations
+```{r}
+bioheart_conc_BIO <- extract_BIO_bioheart(bioheart_conc_common)
+chimp_conc_BIO <- extract_BIO_chimp(chimp_conc_common)  
+check_distribution(bioheart_conc_BIO, chimp_conc_BIO)
+pca_visualisation_detailed(bioheart_conc_BIO, chimp_conc_BIO)
+plot_correlations(bioheart_conc_BIO, chimp_conc_BIO)
+plot_differences(bioheart_conc_BIO, chimp_conc_BIO)
+```
+
+
+# Checking QC of Raw data sets {.tabset}
+
+## BioHEART {.tabset}
+
+### BioHEART QC funtions
+
+```{r}
+identical(rownames(BH_MI$SampleData), rownames(bioheart_areas_common))
+
+table(BH_MI$SampleData$SampleTypeLabel)
+table(BH_MI$SampleData$Batch)
+```
+
+
+```{r}
+bioheart_qc_IS <- function(bioheart_data_withIS, IS_name){
+  bioheart_data_withIS %>% 
+  mutate(sampleID = rownames(bioheart_data_withIS),
+         order = BH_MI$SampleData$InjectionOrder,
+         sampleType = BH_MI$SampleData$SampleTypeLabel) %>%
+  pivot_longer(cols = -c("sampleID", "order", "sampleType"), names_to = "species", values_to  = "Value") %>% 
+  filter(species == IS_name) %>%
+  ggplot(aes(x = order, y = log2(Value), colour = sampleType)) + 
+    geom_line() + 
+    theme_bw() +  
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+    ggtitle(paste(IS_name, "for sample types"))
+}
+
+bioheart_qc_classTotals <- function(bioheart_data, class_name){
+  bioheart_data %>% 
+  mutate(sampleID = rownames(bioheart_data),
+         order = BH_MI$SampleData$InjectionOrder,
+         sampleType = BH_MI$SampleData$SampleTypeLabel) %>%
+  pivot_longer(cols = -c("sampleID", "order", "sampleType"), names_to = "species", values_to  = "Value") %>% 
+  mutate(class = plyr::mapvalues(species, from = class_mapping$analyte, to = class_mapping$Metabolite_Class, warn_missing = F)) %>%  
+  group_by(class, sampleID, order, sampleType) %>%
+  summarise(Value = sum(Value)) %>%
+  filter(class == class_name) %>%
+  ggplot(aes(x = order, y = log2(Value), colour = sampleType)) + 
+    geom_line() + 
+    theme_bw() +  
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+    ggtitle(paste(class_name, "class totals over time for sample types"))
+}
+
+bioheart_qc_sampleType <- function(bioheart_data, sampleType_name){
+  bioheart_data %>% 
+  mutate(sampleID = rownames(bioheart_data),
+         order = BH_MI$SampleData$InjectionOrder,
+         sampleType = BH_MI$SampleData$SampleTypeLabel) %>%
+  pivot_longer(cols = -c("sampleID", "order", "sampleType"), names_to = "species", values_to  = "Value") %>% 
+  mutate(class = plyr::mapvalues(species, from = class_mapping$analyte, to = class_mapping$Metabolite_Class, warn_missing = F)) %>%  
+  group_by(class, sampleID, order, sampleType) %>%
+  summarise(Value = sum(Value)) %>%
+  filter(sampleType == sampleType_name) %>%
+  ggplot(aes(x = order, y = log2(Value), colour = class)) + 
+    geom_line() + 
+    theme_bw() +  
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+    ggtitle(paste("Class totals over time for", sampleType_name))
+}
+```
+
+### BioHEART IS QC
+
+```{r}
+bioheart_qc_IS(bioheart_areas_common_withIS, "acyl_carnitine_16_0_d3_is")
+bioheart_qc_IS(bioheart_areas_common_withIS, "cer_d18_1_d7_18_0_is")
+bioheart_qc_IS(bioheart_areas_common_withIS, "sph_d17_1_is")
+bioheart_qc_IS(bioheart_areas_common_withIS, "fa_18_1_d9_is")
+bioheart_qc_IS(bioheart_areas_common_withIS, "lpi_13_0_is")
+```
+
+### BioHEART Class totals over time
+
+```{r}
+bioheart_qc_classTotals(bioheart_areas_common, "PC")
+bioheart_qc_classTotals(bioheart_areas_common, "TG [NL]")
+bioheart_qc_classTotals(bioheart_areas_common, "Cer(m)")
+bioheart_qc_classTotals(bioheart_areas_common, "COH")
+bioheart_qc_classTotals(bioheart_areas_common, "Hex3Cer")
+bioheart_qc_classTotals(bioheart_areas_common, "GM1")
+```
+
+
+### BioHEART sample types over time
+
+```{r}
+bioheart_qc_sampleType(bioheart_areas_common, "BIO")
+bioheart_qc_sampleType(bioheart_areas_common, "PQC")
+bioheart_qc_sampleType(bioheart_areas_common, "TQC")
+bioheart_qc_sampleType(bioheart_areas_common, "NIST1950")
+bioheart_qc_sampleType(bioheart_areas_common, "BLANK+")
+```
+
+## Chimp {.tabset}
+
+### Chimp QC funtions
+
+```{r}
+chimp_qc_IS <- function(chimp_data_withIS, IS_name){
+  chimp_data_withIS %>% 
+  mutate(sampleID = rownames(chimp_data_withIS),
+         sampleType = sub("( |-).*$", "", rownames(chimp_data_withIS))) %>%
+  pivot_longer(cols = -c("sampleID", "sampleType"), names_to = "species", values_to  = "Value") %>%
+  filter(species == IS_name) %>%
+  ggplot(aes(x = sampleType, y = log2(Value), colour = sampleType)) + 
+    geom_boxplot() + 
+    theme_bw() +  
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+    ggtitle(paste(IS_name, "for sample types"))
+}
+
+chimp_qc_classTotals <- function(chimp_data, class_name){
+  chimp_data %>% 
+  mutate(sampleID = rownames(chimp_data),
+         sampleType = sub("( |-).*$", "", rownames(chimp_data))) %>%
+  pivot_longer(cols = -c("sampleID", "sampleType"), names_to = "species", values_to  = "Value") %>% 
+  mutate(class = plyr::mapvalues(species, from = class_mapping$analyte, to = class_mapping$Metabolite_Class, warn_missing = F)) %>%  
+  group_by(class, sampleID, sampleType) %>%
+  summarise(Value = sum(Value)) %>%
+  filter(class == class_name) %>%
+  ggplot(aes(x = sampleType, y = log2(Value), colour = sampleType)) + 
+    geom_boxplot() + 
+    theme_bw() +  
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+    ggtitle(paste(class_name, "class totals for sample types"))
+}
+```
+
+### Chimp IS QC
+
+```{r}
+chimp_qc_IS(chimp_areas_common_withIS, "acyl_carnitine_16_0_d3_is")
+chimp_qc_IS(chimp_areas_common_withIS, "cer_d18_1_d7_18_0_is")
+chimp_qc_IS(chimp_areas_common_withIS, "sph_d17_1_is")
+chimp_qc_IS(chimp_areas_common_withIS, "fa_18_1_d9_is")
+chimp_qc_IS(chimp_areas_common_withIS, "lpi_13_0_is")
+```
+
+### Chimp Class totals over sample type
+
+```{r}
+chimp_qc_classTotals(chimp_areas_common, "PC")
+chimp_qc_classTotals(chimp_areas_common, "TG [NL]")
+chimp_qc_classTotals(chimp_areas_common, "Cer(m)")
+chimp_qc_classTotals(chimp_areas_common, "COH")
+chimp_qc_classTotals(chimp_areas_common, "Hex3Cer")
+chimp_qc_classTotals(chimp_areas_common, "GM1")
+```
+
+
+
+# Merge within data sets {.tabset}
+
+```{r}
+source("data/RUVIII_SPB.R")
+```
+
+## BioHEART all at once {.tabset}
+
+```{r}
+Y <- log2(bioheart_areas_common_withIS+1)
+M <- 1:nrow(Y)
+
+NIST_ind_bioheart <- which(BH_MI$SampleData$SampleTypeLabel == "NIST1950")
+M[NIST_ind_bioheart] <- "NIST"
+
+TQC_ind_bioheart <- which(BH_MI$SampleData$SampleTypeLabel == "TQC")
+M[TQC_ind_bioheart] <- "TQC_bioheart"
+
+PQC_ind_bioheart <- which(BH_MI$SampleData$SampleTypeLabel == "PQC")
+M[PQC_ind_bioheart] <- "PQC_bioheart"
+
+ctl <- str_detect(colnames(Y), "is$")
+# ctl <- 1:ncol(Y)
+
+new_Y <- RUVIII_SPB(Y, M, ctl, k = 3)
+new_Y <- 2^new_Y
+bioheart_areas_norm_withIS <- new_Y %>% data.frame()
+bioheart_areas_norm <- bioheart_areas_norm_withIS[,common_lipids]
+```
+
+### BioHEART IS QC
+
+```{r}
+bioheart_qc_IS(bioheart_areas_norm_withIS, "acyl_carnitine_16_0_d3_is")
+bioheart_qc_IS(bioheart_areas_norm_withIS, "cer_d18_1_d7_18_0_is")
+bioheart_qc_IS(bioheart_areas_norm_withIS, "sph_d17_1_is")
+bioheart_qc_IS(bioheart_areas_norm_withIS, "fa_18_1_d9_is")
+bioheart_qc_IS(bioheart_areas_norm_withIS, "lpi_13_0_is")
+```
+
+### BioHEART Class totals over time
+
+```{r}
+bioheart_qc_classTotals(bioheart_areas_norm, "PC")
+bioheart_qc_classTotals(bioheart_areas_norm, "TG [NL]")
+bioheart_qc_classTotals(bioheart_areas_norm, "Cer(m)")
+bioheart_qc_classTotals(bioheart_areas_norm, "COH")
+bioheart_qc_classTotals(bioheart_areas_norm, "Hex3Cer")
+bioheart_qc_classTotals(bioheart_areas_norm, "GM1")
+```
+
+
+### BioHEART sample types over time
+
+```{r}
+bioheart_qc_sampleType(bioheart_areas_norm, "BIO")
+bioheart_qc_sampleType(bioheart_areas_norm, "PQC")
+bioheart_qc_sampleType(bioheart_areas_norm, "TQC")
+bioheart_qc_sampleType(bioheart_areas_norm, "NIST1950")
+bioheart_qc_sampleType(bioheart_areas_norm, "BLANK+")
+```
+
+## Chimp {.tabset}
+
+```{r}
+Y <- log2(chimp_areas_common_withIS+1)
+M <- 1:nrow(Y)
+
+NIST_ind_chimp <- str_which(rownames(chimp_areas_common_withIS),"NIST")
+M[NIST_ind_chimp] <- "NIST"
+
+TQC_ind_chimp <- str_which(rownames(chimp_areas_common_withIS),"TQC")
+M[TQC_ind_chimp] <- "TQC_chimp"
+
+PQC_ind_chimp <- str_which(rownames(chimp_areas_common_withIS),"PQC")
+M[PQC_ind_chimp] <- "PQC_chimp"
+
+ctl <- str_detect(colnames(Y), "is$")
+# ctl <- 1:ncol(Y)
+
+new_Y <- RUVIII_SPB(Y, M, ctl, k = 3)
+new_Y <- 2^new_Y
+chimp_areas_norm_withIS <- new_Y %>% data.frame()
+chimp_areas_norm <- chimp_areas_norm_withIS[,common_lipids]
+```
+
+### chimp IS QC
+
+```{r}
+chimp_qc_IS(chimp_areas_norm_withIS, "acyl_carnitine_16_0_d3_is")
+chimp_qc_IS(chimp_areas_norm_withIS, "cer_d18_1_d7_18_0_is")
+chimp_qc_IS(chimp_areas_norm_withIS, "sph_d17_1_is")
+chimp_qc_IS(chimp_areas_norm_withIS, "fa_18_1_d9_is")
+chimp_qc_IS(chimp_areas_norm_withIS, "lpi_13_0_is")
+```
+
+### chimp Class totals across sample type
+
+```{r}
+chimp_qc_classTotals(chimp_areas_norm, "PC")
+chimp_qc_classTotals(chimp_areas_norm, "TG [NL]")
+chimp_qc_classTotals(chimp_areas_norm, "Cer(m)")
+chimp_qc_classTotals(chimp_areas_norm, "COH")
+chimp_qc_classTotals(chimp_areas_norm, "Hex3Cer")
+chimp_qc_classTotals(chimp_areas_norm, "GM1")
+```
+
+
+
+# Merging data {.tabset}
+
+Merge on areas using RUVSPB with k = 3, with NIST, replicates, common IS as negative controls 
+
+```{r}
+Y <- log2(rbind(bioheart_areas_norm_withIS, chimp_areas_norm_withIS)+1)
+M <- 1:nrow(Y)
+
+NIST_ind_bioheart <- which(BH_MI$SampleData$SampleTypeLabel == "NIST1950")
+NIST_ind_chimp <- str_which(rownames(chimp_areas_norm_withIS),"NIST")
+NIST_inds <- c(NIST_ind_bioheart, NIST_ind_chimp + nrow(bioheart_areas_norm_withIS))
+M[NIST_inds] <- "NIST"
+
+ctl <- str_detect(colnames(Y), "is$")
+# ctl <- 1:ncol(Y)
+
+new_Y <- RUVIII_SPB(Y, M, ctl, k = 3)
+new_Y <- 2^new_Y
+
+new_bioheart_withIS <- new_Y[1:nrow(bioheart_areas_common_withIS),] %>% data.frame()
+new_bioheart <- new_bioheart_withIS[,common_lipids]
+
+new_chimp_withIS <- new_Y[-(1:nrow(bioheart_areas_norm_withIS)),] %>% data.frame()
+new_chimp <- new_chimp_withIS[,common_lipids]
+```
+
+## BioHEART IS QC
+
+```{r}
+bioheart_qc_IS(new_bioheart_withIS, "acyl_carnitine_16_0_d3_is")
+bioheart_qc_IS(new_bioheart_withIS, "cer_d18_1_d7_18_0_is")
+bioheart_qc_IS(new_bioheart_withIS, "sph_d17_1_is")
+bioheart_qc_IS(new_bioheart_withIS, "fa_18_1_d9_is")
+bioheart_qc_IS(new_bioheart_withIS, "lpi_13_0_is")
+```
+
+## BioHEART Class totals over time
+
+```{r}
+bioheart_qc_classTotals(new_bioheart, "PC")
+bioheart_qc_classTotals(new_bioheart, "TG [NL]")
+bioheart_qc_classTotals(new_bioheart, "Cer(m)")
+bioheart_qc_classTotals(new_bioheart, "COH")
+bioheart_qc_classTotals(new_bioheart, "Hex3Cer")
+bioheart_qc_classTotals(new_bioheart, "GM1")
+```
+
+
+## BioHEART sample types over time
+
+```{r}
+bioheart_qc_sampleType(new_bioheart, "BIO")
+bioheart_qc_sampleType(new_bioheart, "PQC")
+bioheart_qc_sampleType(new_bioheart, "TQC")
+bioheart_qc_sampleType(new_bioheart, "NIST1950")
+bioheart_qc_sampleType(new_bioheart, "BLANK+")
+```
+
+## chimp IS QC
+
+```{r}
+chimp_qc_IS(new_chimp_withIS, "acyl_carnitine_16_0_d3_is")
+chimp_qc_IS(new_chimp_withIS, "cer_d18_1_d7_18_0_is")
+chimp_qc_IS(new_chimp_withIS, "sph_d17_1_is")
+chimp_qc_IS(new_chimp_withIS, "fa_18_1_d9_is")
+chimp_qc_IS(new_chimp_withIS, "lpi_13_0_is")
+```
+
+## chimp Class totals across sample type
+
+```{r}
+chimp_qc_classTotals(new_chimp, "PC")
+chimp_qc_classTotals(new_chimp, "TG [NL]")
+chimp_qc_classTotals(new_chimp, "Cer(m)")
+chimp_qc_classTotals(new_chimp, "COH")
+chimp_qc_classTotals(new_chimp, "Hex3Cer")
+chimp_qc_classTotals(new_chimp, "GM1")
+```
+
+## check NIST
+
+```{r}
+bioheart_nist <- extract_NIST_bioheart(new_bioheart)
+chimp_nist <- extract_NIST_chimp(new_chimp)
+check_distribution(bioheart_nist, chimp_nist)
+pca_visualisation(bioheart_nist, chimp_nist)
+plot_correlations(bioheart_nist, chimp_nist)
+plot_differences(bioheart_nist, chimp_nist)
+```
+
+## check BIO
+
+```{r}
+bioheart_BIO <- extract_BIO_bioheart(new_bioheart)
+chimp_BIO <- extract_BIO_chimp(new_chimp)
+check_distribution(bioheart_BIO, chimp_BIO)
+pca_visualisation_detailed(bioheart_BIO, chimp_BIO)
+plot_correlations(bioheart_BIO, chimp_BIO)
+plot_differences(bioheart_BIO, chimp_BIO)
+```
+
+
+
+## Check PCA with NIST
+
+```{r}
+combined_bc <- log2(rbind(bioheart_BIO, chimp_BIO, bioheart_nist, chimp_nist))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)),
+          rep("NIST", nrow(bioheart_nist) + nrow(chimp_nist)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = cohort)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() +
+  scale_color_manual(values = c("firebrick1", "dodgerblue1", "darkgreen"))
+```
+
+
+
+## Check boxes
+
+```{r}
+combined_bc <- log2(rbind(bioheart_BIO, chimp_BIO))
+batch = c(rep("bioheart", nrow(bioheart_BIO)), 
+          rep("chimp", nrow(chimp_BIO)))
+
+pca_combined = prcomp(combined_bc)
+df_pca <- data.frame(pca_combined$x)
+df_pca$cohort <- batch
+
+tubes_present <- unname(sapply(rownames(bioheart_BIO), function(x) strsplit(x, "_")[[1]][5]))
+tubes_present <- sub(" ", "", tubes_present)
+tubes_present <- c(tubes_present, rep(NA, nrow(chimp_BIO)))
+df_pca$tube_id_clean <- tubes_present
+df_pca$box <- plyr::mapvalues(df_pca$tube_id_clean, from = labels$tube_id_clean, to = labels$Box, warn_missing = F)
+df_pca <- left_join(df_pca, clinical_data, by = "tube_id_clean")
+
+prop_var <- 100*(round(data.frame(summary(pca_combined)$importance)[2,], 4))
+
+ggplot(df_pca, aes(x = PC1, y = PC2, colour = box)) +
+  geom_point() +
+  xlab(paste0("PC1 (", prop_var$PC1, "%)")) + 
+  ylab(paste0("PC2 (", prop_var$PC2, "%)")) +
+  ggtitle("PCA visualisation") +
+  theme_bw() 
+```
+
+
+```{r, eval = FALSE}
+saveRDS(bioheart_BIO, "data/merged/bioheart_BIO_is_20240421.rds")
+saveRDS(chimp_BIO, "data/merged/chimp_BIO_is_20240421.rds")
+saveRDS(class_mapping, "data/merged/class_mapping.rds")
+saveRDS(lipid_name_mapping, "data/merged/lipid_name_mapping.rds")
+```
+
+
+# Checking against clinical factors {.tabset}
+
+## set up
+
+```{r}
+identical(dimnames(bioheart_areas_BIO), dimnames(bioheart_BIO))
+bioheart_removed_variation <- log2(bioheart_BIO) - log2(bioheart_areas_BIO)
+bioheart_removed_variation[1:5,1:5]
+
+bioheart_SampleData <- readRDS("data/merged/bioheart_SampleData.rds")
+```
+
+```{r}
+areas_records <- plyr::mapvalues(rownames(bioheart_removed_variation),
+                                          from = bioheart_SampleData$InjectionLabel,
+                                          to = sub(" ", "", bioheart_SampleData$Other),
+                                          warn_missing = FALSE)
+
+areas_records <- plyr::mapvalues(areas_records,
+                                          from = clinical_data$tube_id_clean,
+                                          to = clinical_data$record_id,
+                                          warn_missing = FALSE)
+
+rownames(bioheart_removed_variation) <- areas_records
+```
+
+```{r}
+key_clinical_vars <- clinical_data %>% select(record_id, age, gender, cacs, bmi) %>%
+  mutate(cacs_log = log2(as.numeric(cacs)+1), .keep = "unused") %>%
+  rename("Age" = "age",
+         "Log2CACS" = "cacs_log",
+         "BMI" = "bmi",
+         "Sex" = "gender")
+
+```
+
+## Check
+
+```{r}
+bioheart_removed_variation %>% 
+  rownames_to_column("record_id") %>%
+  pivot_longer(cols = -record_id, names_to = "species", values_to = "value") %>% 
+  mutate(class = plyr::mapvalues(species, 
+                                 from = class_mapping$analyte, 
+                                 to = class_mapping$Metabolite_Class, 
+                                 warn_missing = F)) %>%
+  group_by(class, record_id) %>%
+  summarise(value = sum(value)) %>%
+  mutate(record_id = as.numeric(record_id)) %>%
+  left_join(key_clinical_vars, by = "record_id") %>%
+  pivot_longer(cols = -c(class, record_id, value), names_to = "variable", values_to = "variable_value") %>%
+  ggplot(aes(x = variable_value, y = value, colour = class)) + 
+    geom_point(size = 0.5) + 
+    theme_bw() +  
+    geom_smooth(method = "lm", se = FALSE) +
+    facet_wrap(~variable, scales = "free") +
+    labs(title = "Removed variation with clinical variables", y = "Removed Variation", x = "") +
+    guides(colour = "none")
+```
+
+```{r}
+cholesterol <- readxl::read_excel("data/bioheart/bioheart_cholesterol_levels.xlsx")
+
+key_cholesterol_vars <- cholesterol %>% select(record_id, tc, ldl, hdl, tgl) %>%
+  rename("Total Cholesterol" = "tc",
+         "LDL" = "ldl",
+         "HDL" = "hdl",
+         "TGL" = "tgl")
+
+bioheart_removed_variation %>% 
+  rownames_to_column("record_id") %>%
+  pivot_longer(cols = -record_id, names_to = "species", values_to = "value") %>% 
+  mutate(class = plyr::mapvalues(species, 
+                                 from = class_mapping$analyte, 
+                                 to = class_mapping$Metabolite_Class, 
+                                 warn_missing = F)) %>%
+  group_by(class, record_id) %>%
+  summarise(value = sum(value)) %>%
+  mutate(record_id = as.numeric(record_id)) %>%
+  left_join(key_cholesterol_vars, by = "record_id") %>%
+  pivot_longer(cols = -c(class, record_id, value), names_to = "variable", values_to = "variable_value") %>%
+  ggplot(aes(x = variable_value, y = value, colour = class)) + 
+    geom_point(size = 0.5) + 
+    theme_bw() +  
+    geom_smooth(method = "lm", se = FALSE) +
+    facet_wrap(~variable, scales = "free") +
+    labs(title = "Removed variation with cholesterol variables", y = "Removed Variation", x = "") +
+    guides(colour = "none")
+```
+
+# Some extra files
+
+```{r}
+lipid_sds <- apply(log2(bioheart_BIO), 2, sd)
+lipid_sds_df <- data.frame(lipid = names(lipid_sds),
+                           sd = lipid_sds)
+write.csv(lipid_sds_df, "lipid_sds.csv", row.names = FALSE)
+```
+
